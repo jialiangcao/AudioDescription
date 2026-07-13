@@ -1,6 +1,9 @@
 import base64
 
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MODEL = "claude-opus-4-8"
 
@@ -64,12 +67,3 @@ def analyze_shots(shots):
     for shot in shots:
         shot["visual"] = analyze_keyframe(client, shot["keyframe"])
     return shots
-
-
-if __name__ == "__main__":
-    from segmentation import segment_video
-
-    shots = segment_video("test.mp4")
-    shots = analyze_shots(shots)
-    for shot in shots:
-        print(shot)

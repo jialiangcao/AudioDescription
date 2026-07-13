@@ -70,11 +70,6 @@ def save_timeline(timeline, out_path="timeline.json"):
     return out_path
 
 
-if __name__ == "__main__":
-    from segmentation import segment_video
-    from vision_analysis import analyze_shots
-
-    shots = segment_video("test.mp4")
-    shots = analyze_shots(shots)
-    timeline = build_timeline("test.mp4", shots)
-    print(save_timeline(timeline))
+def load_timeline(path="timeline.json"):
+    with open(path) as f:
+        return Timeline.model_validate_json(f.read())
