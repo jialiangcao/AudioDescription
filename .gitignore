@@ -1,5 +1,10 @@
 __pycache__
 frames/*
-venv
+.venv
 *.wav
 *.mp4
+.env
+*.json
+out/*
+in/*
+^(?!.*readme).*\.md$

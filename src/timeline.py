@@ -1,0 +1,113 @@
+import json
+
+import cv2
+from pydantic import BaseModel
+
+
+class VisualAnalysis(BaseModel):
+    description: str
+    entities: list[str]
+    setting: str
+    on_screen_text: str | None
+
+
+class AudioAnalysis(BaseModel):
+    has_speech: bool
+    transcript: str | None
+    silence_ratio: float
+
+
+# Minimum speech-free time within a shot for it to be worth narrating.
+MIN_NARRATABLE_GAP_SEC = 2.0
+
+# Standard audio-description pacing, in words per second.
+NARRATION_WORDS_PER_SEC = 2.5
+
+
+class Segment(BaseModel):
+    id: int
+    start: float
+    end: float
+    keyframe: str
+    visual: VisualAnalysis
+    audio: AudioAnalysis | None = None
+    ad_eligible: bool | None = None
+    narratable_gap_sec: float | None = None
+    # Populated by vision_analysis.fill_narration_gaps for ad_eligible segments.
+    ad_narration: str | None = None
+
+
+class Timeline(BaseModel):
+    video_id: str
+    duration_sec: float
+    segments: list[Segment]
+
+
+def _overlap_sec(a_start, a_end, b_start, b_end):
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def _speech_seconds_within(start, end, speech_regions):
+    return sum(_overlap_sec(start, end, s_start, s_end) for s_start, s_end in speech_regions)
+
+
+def _transcript_within(start, end, transcript_segments):
+    texts = [
+        seg["text"]
+        for seg in transcript_segments
+        if _overlap_sec(start, end, seg["start"], seg["end"]) > 0
+    ]
+    return " ".join(texts) if texts else None
+
+
+def _build_audio_analysis(start, end, speech_regions, transcript_segments):
+    duration = end - start
+    speech_sec = _speech_seconds_within(start, end, speech_regions)
+    silence_ratio = 1.0 - (speech_sec / duration) if duration > 0 else 1.0
+
+    return AudioAnalysis(
+        has_speech=speech_sec > 0,
+        transcript=_transcript_within(start, end, transcript_segments),
+        silence_ratio=round(silence_ratio, 4),
+    )
+
+
+def build_timeline(video_path, shots, speech_regions=None, transcript_segments=None):
+    speech_regions = speech_regions or []
+    transcript_segments = transcript_segments or []
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration_sec = frame_count / fps if fps else 0.0
+    cap.release()
+
+    segments = []
+    for shot in shots:
+        start, end = shot["start"], shot["end"]
+        audio = _build_audio_analysis(start, end, speech_regions, transcript_segments)
+        narratable_gap_sec = round(audio.silence_ratio * (end - start), 2)
+
+        segments.append(Segment(
+            id=shot["id"],
+            start=start,
+            end=end,
+            keyframe=shot["keyframe"],
+            visual=VisualAnalysis(**shot["visual"]),
+            audio=audio,
+            ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
+            narratable_gap_sec=narratable_gap_sec,
+        ))
+
+    return Timeline(video_id=video_path, duration_sec=duration_sec, segments=segments)
+
+
+def save_timeline(timeline, out_path="timeline.json"):
+    with open(out_path, "w") as f:
+        f.write(timeline.model_dump_json(indent=2))
+    return out_path
+
+
+def load_timeline(path="timeline.json"):
+    with open(path) as f:
+        return Timeline.model_validate_json(f.read())

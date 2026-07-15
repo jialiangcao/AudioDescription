@@ -45,7 +45,3 @@ def extract_audio(video_path, out_path="audio.wav", sample_rate=16000):
         capture_output=True, text=True, check=True,
     )
     return out_path
-
-
-if __name__ == "__main__":
-    print(extract_audio("test.mp4"))

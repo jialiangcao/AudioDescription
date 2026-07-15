@@ -1,6 +1,0 @@
-numpy
-opencv-python
-scenedetect
-anthropic
-pydantic
-python-dotenv

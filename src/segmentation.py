@@ -57,8 +57,3 @@ def extract_keyframes(video_path, shots, out_dir="frames"):
 def segment_video(video_path, out_dir="frames", threshold=27.0):
     shots = detect_shots(video_path, threshold=threshold)
     return extract_keyframes(video_path, shots, out_dir=out_dir)
-
-
-if __name__ == "__main__":
-    for shot in segment_video("test.mp4"):
-        print(shot)
