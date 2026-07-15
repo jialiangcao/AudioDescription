@@ -22,10 +22,13 @@ def detect_shots(video_path, threshold=27.0):
     return [(start.seconds, end.seconds) for start, end in scene_list]
 
 
-def extract_keyframes(video_path, shots, out_dir="frames"):
-    """Extract one representative keyframe (midpoint) per shot.
+def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
+    """Extract frames sampled every `interval_sec` within each shot.
 
-    Returns a list of shot dicts: {id, start, end, keyframe}.
+    Returns a list of shot dicts: {id, start, end, keyframe, keyframes}, where
+    `keyframe` is the single sampled frame closest to the shot's midpoint (kept
+    for backward compatibility with the rest of the pipeline) and `keyframes` is
+    every sampled frame path in the shot, in temporal order.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -34,21 +37,37 @@ def extract_keyframes(video_path, shots, out_dir="frames"):
 
     shot_records = []
     for i, (start, end) in enumerate(shots):
+        timestamps = []
+        t = start
+        while t <= end:
+            timestamps.append(t)
+            t += interval_sec
+        if not timestamps:
+            timestamps = [start]
+
         midpoint = (start + end) / 2
-        frame_idx = int(midpoint * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        if not ok:
+        paths = []
+        for t in timestamps:
+            frame_idx = int(t * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            path = os.path.join(out_dir, f"shot_{i:04d}_{len(paths):02d}.jpg")
+            cv2.imwrite(path, frame)
+            paths.append((t, path))
+
+        if not paths:
             continue
 
-        path = os.path.join(out_dir, f"shot_{i:04d}.jpg")
-        cv2.imwrite(path, frame)
+        keyframe = min(paths, key=lambda tp: abs(tp[0] - midpoint))[1]
         shot_records.append(
             {
                 "id": i,
                 "start": round(start, 2),
                 "end": round(end, 2),
-                "keyframe": path,
+                "keyframe": keyframe,
+                "keyframes": [p for _, p in paths],
             }
         )
 

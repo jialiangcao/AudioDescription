@@ -14,7 +14,7 @@ Dependencies are managed with `uv` (Python 3.12, see `pyproject.toml` / `uv.lock
 
 ```bash
 uv sync                       # install dependencies
-uv run python src/main.py     # run the full pipeline on in/test.mp4
+uv run python src/main.py     # run the full pipeline on src/in/test.mp4
 ```
 
 Requires `ffmpeg`/`ffprobe` on PATH (used for audio extraction) and an `ANTHROPIC_API_KEY` in
@@ -24,8 +24,8 @@ There is no test suite and no linter/formatter configured in this repo.
 
 ### Re-running the pipeline
 
-`process_video()` in `src/main.py` short-circuits if `out/timeline.json` already exists — it
-loads and prints the cached timeline instead of reprocessing. Delete `out/timeline.json` (or
+`process_video()` in `src/main.py` short-circuits if `src/out/timeline.json` already exists — it
+loads and prints the cached timeline instead of reprocessing. Delete `src/out/timeline.json` (or
 pass a different `timeline_path`) to force a full re-run.
 
 ## Architecture
@@ -69,9 +69,12 @@ layout, unless deliberately migrating away from this.
 
 ### I/O layout
 
-- `in/` — source videos/audio (gitignored).
-- `out/` — pipeline artifacts: extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, and the
-  final `timeline.json` (gitignored).
+- `src/in/` — source videos/audio (gitignored).
+- `src/out/` — pipeline artifacts: extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, and
+  the final `timeline.json` (gitignored).
 
 Both Claude calls (shot description and gap narration) use the same `MODEL` constant in
 `vision_analysis.py`.
+
+### Dev tools
+This project uses ruff lint and pyright type checking, ensure there are no errors with either of these in the code you write/edit.

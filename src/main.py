@@ -2,15 +2,16 @@ import os
 from pathlib import Path
 
 from audio_extract import NoAudioStreamError, extract_audio
+from qa import answer_question
 from segmentation import segment_video
 from timeline import build_timeline, load_timeline, save_timeline
 from transcription import transcribe
 from vision_analysis import analyze_shots, fill_narration_gaps
 from voice_activity import detect_speech_regions
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-IN_DIR = ROOT_DIR / "in"
-OUT_DIR = ROOT_DIR / "out"
+SRC_DIR = Path(__file__).resolve().parent
+IN_DIR = SRC_DIR / "in"
+OUT_DIR = SRC_DIR / "out"
 
 
 def print_timeline(timeline):
@@ -95,3 +96,4 @@ def process_video(video_path, frames_dir=None, audio_path=None, timeline_path=No
 
 if __name__ == "__main__":
     timeline = process_video(str(IN_DIR / "test.mp4"))
+    print(answer_question(timeline, "What color is the woman's eyes"))

@@ -1,5 +1,5 @@
 import cv2
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class VisualAnalysis(BaseModel):
@@ -27,6 +27,8 @@ class Segment(BaseModel):
     start: float
     end: float
     keyframe: str
+    # Every frame sampled within the shot (segmentation.py's interval_sec), for CLIP retrieval.
+    keyframes: list[str] = Field(default_factory=list)
     visual: VisualAnalysis
     audio: AudioAnalysis | None = None
     ad_eligible: bool | None = None
@@ -94,6 +96,7 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
                 start=start,
                 end=end,
                 keyframe=shot["keyframe"],
+                keyframes=shot.get("keyframes", []),
                 visual=VisualAnalysis(**shot["visual"]),
                 audio=audio,
                 ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
