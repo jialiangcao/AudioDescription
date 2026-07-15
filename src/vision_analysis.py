@@ -43,23 +43,29 @@ def analyze_keyframe(client, keyframe_path):
         model=MODEL,
         max_tokens=1024,
         output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_data,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
                     },
-                },
-                {"type": "text", "text": "Describe what is visually happening in this video frame."},
-            ],
-        }],
+                    {
+                        "type": "text",
+                        "text": "Describe what is visually happening in this video frame.",
+                    },
+                ],
+            }
+        ],
     )
 
     import json
+
     text = next(b.text for b in response.content if b.type == "text")
     return json.loads(text)
 
@@ -86,7 +92,7 @@ def generate_narration(client, segment, max_words, neighbor_transcript=None):
     if segment.visual.on_screen_text:
         context += f"\nOn-screen text: {segment.visual.on_screen_text}"
     if neighbor_transcript:
-        context += f"\nNearby dialogue (for continuity, do not repeat): \"{neighbor_transcript}\""
+        context += f'\nNearby dialogue (for continuity, do not repeat): "{neighbor_transcript}"'
 
     with open(segment.keyframe, "rb") as f:
         image_data = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -104,20 +110,22 @@ def generate_narration(client, segment, max_words, neighbor_transcript=None):
     response = client.messages.create(
         model=MODEL,
         max_tokens=256,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_data,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
                     },
-                },
-                {"type": "text", "text": prompt},
-            ],
-        }],
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
     )
 
     return next(b.text for b in response.content if b.type == "text").strip()
@@ -132,6 +140,8 @@ def fill_narration_gaps(timeline, words_per_sec=None):
             continue
         max_words = max(3, int(segment.narratable_gap_sec * words_per_sec))
         neighbor_transcript = _neighbor_transcript(timeline.segments, i)
-        segment.ad_narration = generate_narration(client, segment, max_words, neighbor_transcript)
+        segment.ad_narration = generate_narration(
+            client, segment, max_words, neighbor_transcript
+        )
 
     return timeline

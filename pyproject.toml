@@ -17,3 +17,38 @@ dependencies = [
     "torchaudio>=2.11.0",
     "torchcodec>=0.15.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "pyright>=1.1.411",
+    "ruff>=0.15.21",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify code
+]
+
+ignore = [
+    "E501", # line length handled by formatter
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"

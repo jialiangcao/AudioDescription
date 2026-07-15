@@ -10,13 +10,20 @@ class NoAudioStreamError(Exception):
 def has_audio_stream(video_path):
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index",
-            "-of", "json",
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "json",
             video_path,
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     streams = json.loads(result.stdout).get("streams", [])
     return len(streams) > 0
@@ -34,14 +41,21 @@ def extract_audio(video_path, out_path="audio.wav", sample_rate=16000):
 
     subprocess.run(
         [
-            "ffmpeg", "-y",
-            "-i", video_path,
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
             "-vn",
-            "-ac", "1",
-            "-ar", str(sample_rate),
-            "-acodec", "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-acodec",
+            "pcm_s16le",
             out_path,
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return out_path

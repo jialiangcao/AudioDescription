@@ -1,5 +1,3 @@
-import json
-
 import cv2
 from pydantic import BaseModel
 
@@ -48,7 +46,9 @@ def _overlap_sec(a_start, a_end, b_start, b_end):
 
 
 def _speech_seconds_within(start, end, speech_regions):
-    return sum(_overlap_sec(start, end, s_start, s_end) for s_start, s_end in speech_regions)
+    return sum(
+        _overlap_sec(start, end, s_start, s_end) for s_start, s_end in speech_regions
+    )
 
 
 def _transcript_within(start, end, transcript_segments):
@@ -88,16 +88,18 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
         audio = _build_audio_analysis(start, end, speech_regions, transcript_segments)
         narratable_gap_sec = round(audio.silence_ratio * (end - start), 2)
 
-        segments.append(Segment(
-            id=shot["id"],
-            start=start,
-            end=end,
-            keyframe=shot["keyframe"],
-            visual=VisualAnalysis(**shot["visual"]),
-            audio=audio,
-            ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
-            narratable_gap_sec=narratable_gap_sec,
-        ))
+        segments.append(
+            Segment(
+                id=shot["id"],
+                start=start,
+                end=end,
+                keyframe=shot["keyframe"],
+                visual=VisualAnalysis(**shot["visual"]),
+                audio=audio,
+                ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
+                narratable_gap_sec=narratable_gap_sec,
+            )
+        )
 
     return Timeline(video_id=video_path, duration_sec=duration_sec, segments=segments)
 

@@ -1,10 +1,8 @@
 __pycache__
-frames/*
 .venv
-*.wav
-*.mp4
 .env
-*.json
 out/*
 in/*
 ^(?!.*readme).*\.md$
+.claude
+.DS_Store

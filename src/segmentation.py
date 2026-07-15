@@ -1,7 +1,7 @@
 import os
 
 import cv2
-from scenedetect import open_video, SceneManager
+from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
 
@@ -17,7 +17,7 @@ def detect_shots(video_path, threshold=27.0):
     scene_list = scene_manager.get_scene_list()
 
     if not scene_list:
-        return [(0.0, video.duration.seconds)]
+        return [(0.0, video.duration)]
 
     return [(start.seconds, end.seconds) for start, end in scene_list]
 
@@ -43,12 +43,14 @@ def extract_keyframes(video_path, shots, out_dir="frames"):
 
         path = os.path.join(out_dir, f"shot_{i:04d}.jpg")
         cv2.imwrite(path, frame)
-        shot_records.append({
-            "id": i,
-            "start": round(start, 2),
-            "end": round(end, 2),
-            "keyframe": path,
-        })
+        shot_records.append(
+            {
+                "id": i,
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "keyframe": path,
+            }
+        )
 
     cap.release()
     return shot_records
