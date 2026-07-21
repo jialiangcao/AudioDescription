@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `adesc` generates audio-description (AD) narration for video: it detects shots, describes each
 shot visually, transcribes dialogue, finds speech-free gaps long enough to narrate, and asks
-Claude to write a narration line sized to fit each gap. It also features interactive Q&A.
+Gemini to write a narration line sized to fit each gap. It also features interactive Q&A.
 
 ## Commands
 
@@ -17,7 +17,7 @@ uv sync                       # install dependencies
 uv run python src/main.py     # run the full pipeline on src/in/test.mp4
 ```
 
-Requires `ffmpeg`/`ffprobe` on PATH (used for audio extraction) and an `ANTHROPIC_API_KEY` in
+Requires `ffmpeg`/`ffprobe` on PATH (used for audio extraction) and a `GEMINI_API_KEY` in
 `.env` (loaded via `python-dotenv`).
 
 There is no test suite and no linter/formatter configured in this repo.
@@ -36,7 +36,7 @@ The pipeline (`src/main.py::process_video`) runs six stages, each in its own mod
 1. **`segmentation.py`** — `segment_video()` uses PySceneDetect (`ContentDetector`) to find shot
    (camera cut) boundaries, then grabs one midpoint keyframe per shot via OpenCV. Produces a
    list of shot dicts: `{id, start, end, keyframe}`.
-2. **`vision_analysis.py`** — `analyze_shots()` sends each keyframe to Claude (vision, structured
+2. **`vision_analysis.py`** — `analyze_shots()` sends each keyframe to Gemini (vision, structured
    JSON-schema output) to get `description`, `entities`, `setting`, `on_screen_text`.
 3. **`audio_extract.py`** — `extract_audio()` shells out to `ffmpeg` to pull a 16kHz mono WAV
    (the format Silero VAD and Whisper expect). Raises `NoAudioStreamError` if the source video
@@ -51,7 +51,7 @@ The pipeline (`src/main.py::process_video`) runs six stages, each in its own mod
    pydantic `Timeline` (list of `Segment`s). Per segment it computes `silence_ratio` (fraction of
    the shot with no detected speech), `narratable_gap_sec` (silence_ratio × shot duration), and
    `ad_eligible` (gap ≥ `MIN_NARRATABLE_GAP_SEC`, currently 2.0s). Then
-   `vision_analysis.fill_narration_gaps()` calls Claude again for each `ad_eligible` segment,
+   `vision_analysis.fill_narration_gaps()` calls Gemini again for each `ad_eligible` segment,
    capping narration length via `NARRATION_WORDS_PER_SEC` (2.5 wps) applied to
    `narratable_gap_sec`, and feeding neighboring dialogue as context so narration doesn't repeat
    what's already said.
@@ -73,7 +73,7 @@ layout, unless deliberately migrating away from this.
 - `src/out/` — pipeline artifacts: extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, and
   the final `timeline.json` (gitignored).
 
-Both Claude calls (shot description and gap narration) use the same `MODEL` constant in
+Both Gemini calls (shot description and gap narration) use the same `MODEL` constant in
 `vision_analysis.py`.
 
 ### Dev tools

@@ -1,36 +1,27 @@
-import base64
-import json
 from collections.abc import Callable
 from typing import cast
 
-import anthropic
 import open_clip
 import torch
-from anthropic.types import TextBlock
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from PIL import Image
+from pydantic import BaseModel
 
 from timeline import Timeline
 
 load_dotenv()
 
-client = anthropic.Anthropic()
-MODEL = "claude-sonnet-4-6"
+client = genai.Client()
+MODEL = "gemini-2.5-flash"
 
 # Number of CLIP-retrieved frames sent to the VLM in a single batch.
 TOP_K_FRAMES = 10
 
-SHOULD_USE_VLM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "use_vlm": {
-            "type": "boolean",
-            "description": "True if the question requires nuance/abstract/complicated thinking to solve, false if it involves localization/scene description/object/entity descriptions or retrieval",
-        },
-    },
-    "required": ["use_vlm"],
-    "additionalProperties": False,
-}
+
+class UseVlmDecision(BaseModel):
+    use_vlm: bool
 
 
 def _pick_device() -> torch.device:
@@ -156,63 +147,47 @@ retriever = ClipFrameRetriever()
 
 def should_use_vlm(question: str) -> bool:
     print(f"[qa] should_use_vlm: asking {MODEL} to route question={question!r}")
-    response = client.messages.create(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=50,
-        output_config={
-            "format": {"type": "json_schema", "schema": SHOULD_USE_VLM_SCHEMA}
-        },
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Decide if this video question requires repeated iterative VLM reasoning for complex, nuanced, or abstract questions (true), or "
-                    "if CLIP based retrieval with one VLM pass will suffice, intended for scene/object/entity descriptions or any simple question. (false).\n\n"
-                    f"Question:\n{question}"
-                    "\nAlways return false"  # TODO: Fix this prompt"
-                ),
-            }
-        ],
+        contents=(
+            "Decide if this video question requires repeated iterative VLM reasoning for complex, nuanced, or abstract questions (true), or "
+            "if CLIP based retrieval with one VLM pass will suffice, intended for scene/object/entity descriptions or any simple question. (false).\n\n"
+            f"Question:\n{question}"
+            "\nAlways return false"  # TODO: Fix this prompt
+        ),
+        config=types.GenerateContentConfig(
+            max_output_tokens=50,
+            response_mime_type="application/json",
+            response_schema=UseVlmDecision,
+        ),
     )
 
-    block = response.content[0]
-    if isinstance(block, TextBlock):
-        result = json.loads(block.text)
-        print(
-            f"[qa] should_use_vlm: routed to {'VLM + CLIP' if result['use_vlm'] else 'CLIP only'}"
-        )
-        return result["use_vlm"]
-
+    if response.text is None:
+        raise RuntimeError(f"{MODEL} returned no text for should_use_vlm routing")
+    result = UseVlmDecision.model_validate_json(response.text)
     print(
-        f"[qa] should_use_vlm: expected a text block, got {type(block).__name__}; defaulting to CLIP only"
+        f"[qa] should_use_vlm: routed to {'VLM + CLIP' if result.use_vlm else 'CLIP only'}"
     )
-    return False
+    return result.use_vlm
 
 
 def _ask_vlm(question: str, frame_paths: list[str]) -> str:
     print(f"[qa] _ask_vlm: sending {len(frame_paths)} frame(s) + question to {MODEL}")
-    content = []
+    contents = []
     for path in frame_paths:
         with open(path, "rb") as f:
-            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-        content.append(
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": image_data,
-                },
-            }
-        )
-    content.append({"type": "text", "text": question})
+            image_bytes = f.read()
+        contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+    contents.append(question)
 
-    response = client.messages.create(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": content}],
+        contents=contents,
+        config=types.GenerateContentConfig(max_output_tokens=1024),
     )
-    answer = next(b.text for b in response.content if b.type == "text").strip()
+    if response.text is None:
+        raise RuntimeError(f"{MODEL} returned no text for _ask_vlm")
+    answer = response.text.strip()
     print(f"[qa] _ask_vlm: answer ({len(answer)} chars): {answer!r}")
     return answer
 
