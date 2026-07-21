@@ -1,5 +1,9 @@
+import logging
+
 import cv2
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class VisualAnalysis(BaseModel):
@@ -88,6 +92,10 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     duration_sec = frame_count / fps if fps else 0.0
     cap.release()
+    if not fps:
+        logger.warning(
+            "build_timeline: could not read fps for %s, duration=0", video_path
+        )
 
     segments = []
     for shot in shots:
@@ -109,6 +117,14 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
             )
         )
 
+    eligible = sum(1 for s in segments if s.ad_eligible)
+    logger.debug(
+        "build_timeline: %s -> %d segment(s), %d AD-eligible, duration=%.2fs",
+        video_path,
+        len(segments),
+        eligible,
+        duration_sec,
+    )
     return Timeline(video_id=video_path, duration_sec=duration_sec, segments=segments)
 
 

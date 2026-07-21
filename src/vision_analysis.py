@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 
 from dotenv import load_dotenv
@@ -9,6 +10,8 @@ from pydantic import BaseModel
 from timeline import NARRATION_WORDS_PER_SEC, Segment, Timeline
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 MODEL = "gemini-2.5-flash"
 
@@ -25,6 +28,7 @@ class ShotAnalysis(BaseModel):
 
 
 async def analyze_keyframe(client, keyframe_path):
+    logger.debug("analyze_keyframe: %s -> %s", keyframe_path, MODEL)
     with open(keyframe_path, "rb") as f:
         image_bytes = f.read()
 
@@ -42,6 +46,9 @@ async def analyze_keyframe(client, keyframe_path):
     )
 
     if response.text is None:
+        logger.error(
+            "analyze_keyframe: %s returned no text for %s", MODEL, keyframe_path
+        )
         raise RuntimeError(f"{MODEL} returned no text for {keyframe_path}")
     return ShotAnalysis.model_validate_json(response.text).model_dump()
 
@@ -61,6 +68,7 @@ async def analyze_shots(
     """
     client = client or genai.Client()
     semaphore = asyncio.Semaphore(concurrency)
+    logger.info("analyze_shots: %d shot(s), concurrency=%d", len(shots), concurrency)
 
     async def _run(shot):
         async with semaphore:
@@ -70,6 +78,7 @@ async def analyze_shots(
         return shot
 
     await asyncio.gather(*(_run(shot) for shot in shots))
+    logger.info("analyze_shots: all %d shot(s) analyzed", len(shots))
     return shots
 
 
@@ -113,6 +122,11 @@ async def generate_narration(client, segment, max_words, neighbor_transcript=Non
     )
 
     if response.text is None:
+        logger.error(
+            "generate_narration: %s returned no text for segment keyframe %s",
+            MODEL,
+            segment.keyframe,
+        )
         raise RuntimeError(f"{MODEL} returned no text for {segment.keyframe}")
     return response.text.strip()
 
@@ -133,10 +147,22 @@ async def fill_narration_gaps(
     words_per_sec = words_per_sec or NARRATION_WORDS_PER_SEC
     client = client or genai.Client()
     semaphore = asyncio.Semaphore(concurrency)
+    eligible = [seg for seg in timeline.segments if seg.ad_eligible]
+    logger.info(
+        "fill_narration_gaps: %d eligible segment(s), concurrency=%d",
+        len(eligible),
+        concurrency,
+    )
 
     async def _run(i, segment):
         max_words = max(3, int(segment.narratable_gap_sec * words_per_sec))
         neighbor_transcript = _neighbor_transcript(timeline.segments, i)
+        logger.debug(
+            "fill_narration_gaps: segment %s, gap=%.2fs, max_words=%d",
+            segment.id,
+            segment.narratable_gap_sec,
+            max_words,
+        )
         async with semaphore:
             segment.ad_narration = await generate_narration(
                 client, segment, max_words, neighbor_transcript
@@ -152,4 +178,5 @@ async def fill_narration_gaps(
         )
     )
 
+    logger.info("fill_narration_gaps: wrote %d narration line(s)", len(eligible))
     return timeline

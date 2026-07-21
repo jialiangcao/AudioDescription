@@ -11,6 +11,7 @@ non-reentrant model instance.
 """
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable
 
@@ -18,6 +19,8 @@ import numpy as np
 import soundfile as sf
 
 from timeline import Segment, Timeline
+
+logger = logging.getLogger(__name__)
 
 VOICE = "af_heart"
 SAMPLE_RATE = 24000
@@ -32,6 +35,7 @@ _PIPELINE = None
 def _load_pipeline():
     global _PIPELINE
     if _PIPELINE is None:
+        logger.info("loading Kokoro TTS pipeline (voice=%s)", VOICE)
         from kokoro import KPipeline
 
         _PIPELINE = KPipeline(lang_code="a")  # American English
@@ -66,6 +70,13 @@ def _synthesize_segment(segment: Segment, gap_sec: float, out_dir: str) -> None:
 
     if duration > gap_sec:
         speed = min(MAX_SPEED, duration / gap_sec)
+        logger.debug(
+            "segment %s: %.2fs clip over %.2fs gap, re-synthesizing at speed=%.2f",
+            segment.id,
+            duration,
+            gap_sec,
+            speed,
+        )
         audio = _synthesize(segment.ad_narration, speed=speed)
         duration = _duration_sec(audio)
 
@@ -75,6 +86,13 @@ def _synthesize_segment(segment: Segment, gap_sec: float, out_dir: str) -> None:
     segment.ad_narration_audio = path
     segment.ad_narration_duration_sec = round(duration, 3)
     segment.ad_narration_overflow = duration > gap_sec
+    if segment.ad_narration_overflow:
+        logger.warning(
+            "segment %s: narration still overflows gap after speed-up (%.2fs > %.2fs)",
+            segment.id,
+            duration,
+            gap_sec,
+        )
 
 
 async def synthesize_narration(
@@ -91,6 +109,7 @@ async def synthesize_narration(
     """
     os.makedirs(out_dir, exist_ok=True)
 
+    synthesized = 0
     for segment in timeline.segments:
         if (
             not segment.ad_eligible
@@ -99,10 +118,13 @@ async def synthesize_narration(
         ):
             continue
 
+        logger.debug("synthesize_narration: segment %s -> %s", segment.id, out_dir)
         await asyncio.to_thread(
             _synthesize_segment, segment, segment.narratable_gap_sec, out_dir
         )
+        synthesized += 1
         if on_segment is not None:
             await on_segment(segment)
 
+    logger.info("synthesize_narration: wrote %d narration clip(s)", synthesized)
     return timeline

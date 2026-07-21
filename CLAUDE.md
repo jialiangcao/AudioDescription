@@ -109,6 +109,18 @@ than introducing a package layout, unless deliberately migrating away from this.
 Both Gemini calls (shot description and gap narration) use the same `MODEL` constant in
 `vision_analysis.py`.
 
+### Logging
+
+`src/log_config.py::configure_logging()` installs the root logger's level + formatter; the server
+calls it once at import (after `load_dotenv()`). Every module logs through its own
+`logging.getLogger(__name__)` and never touches handlers/levels itself, so tests and embedders keep
+control. Level comes from the `ADESC_LOG_LEVEL` env var (default `INFO`; use `DEBUG` for the
+verbose per-shot / per-frame / per-segment traces, `WARNING` for problems only). Convention: `INFO`
+for stage boundaries and job-lifecycle transitions, `DEBUG` for per-item detail, `WARNING` for
+recoverable oddities (no audio stream, no cuts detected, narration overflow), `ERROR` /
+`logger.exception` for failures. Noisy third-party loggers (`httpx`, `faster_whisper`, …) are
+pinned to `WARNING` unless the level is `DEBUG`.
+
 ### Dev tools
 This project uses ruff lint and pyright type checking, ensure there are no errors with either of these in the code you write/edit.
 

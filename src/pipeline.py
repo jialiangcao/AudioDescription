@@ -10,6 +10,8 @@ callback — which keeps it unit-testable in isolation.
 """
 
 import asyncio
+import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from transcription import transcribe
 from tts import synthesize_narration
 from vision_analysis import analyze_shots, fill_narration_gaps
 from voice_activity import detect_speech_regions
+
+logger = logging.getLogger(__name__)
 
 OnEvent = Callable[[dict], Awaitable[None]]
 
@@ -56,11 +60,19 @@ async def run_pipeline(
     frames_dir = job_dir / "frames"
     audio_path = job_dir / "audio.wav"
     narration_dir = job_dir / "narration"
+    logger.info("pipeline start: %s", video_path)
 
     # 1. Shot segmentation (CPU-bound: PySceneDetect + OpenCV).
+    logger.info("stage 1/7 segmentation: detecting shots + keyframes")
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
+    t0 = time.monotonic()
     shots = await asyncio.to_thread(
         segment_video, str(video_path), out_dir=str(frames_dir)
+    )
+    logger.info(
+        "stage 1/7 segmentation done: %d shot(s) in %.1fs",
+        len(shots),
+        time.monotonic() - t0,
     )
     await on_event(
         {
@@ -72,12 +84,16 @@ async def run_pipeline(
     )
 
     # 2. Vision analysis (network-bound Gemini calls, run concurrently).
+    logger.info("stage 2/7 vision: describing %d shot(s) via Gemini", len(shots))
     await on_event({"type": "stage", "stage": "vision", "status": "start"})
+    t0 = time.monotonic()
 
     async def _on_shot(shot: dict) -> None:
+        logger.debug("shot %s described", shot["id"])
         await on_event(_shot_event(shot))
 
     shots = await analyze_shots(shots, on_shot=_on_shot, client=client)
+    logger.info("stage 2/7 vision done in %.1fs", time.monotonic() - t0)
     await on_event({"type": "stage", "stage": "vision", "status": "done"})
 
     # 3-5. Audio: extraction (CPU/ffmpeg) → VAD → transcription. A video with
@@ -85,7 +101,9 @@ async def run_pipeline(
     # the original CLI did.
     speech_regions: list = []
     transcript_segments: list = []
+    logger.info("stage 3-5/7 audio: extract -> VAD -> transcribe")
     await on_event({"type": "stage", "stage": "audio", "status": "start"})
+    t0 = time.monotonic()
     try:
         await asyncio.to_thread(
             extract_audio, str(video_path), out_path=str(audio_path)
@@ -93,6 +111,12 @@ async def run_pipeline(
         speech_regions = await asyncio.to_thread(detect_speech_regions, str(audio_path))
         transcript_segments = await asyncio.to_thread(
             transcribe, str(audio_path), speech_regions
+        )
+        logger.info(
+            "stage 3-5/7 audio done in %.1fs: %d speech region(s), %d dialogue segment(s)",
+            time.monotonic() - t0,
+            len(speech_regions),
+            len(transcript_segments),
         )
         await on_event(
             {
@@ -105,11 +129,15 @@ async def run_pipeline(
             }
         )
     except NoAudioStreamError:
+        logger.warning(
+            "stage 3-5/7 audio: no audio stream, skipping VAD + transcription"
+        )
         await on_event(
             {"type": "stage", "stage": "audio", "status": "done", "has_audio": False}
         )
 
     # 6. Timeline assembly (CPU-bound) then narration generation (Gemini).
+    logger.info("stage 6/7 timeline: assembling segments")
     await on_event({"type": "stage", "stage": "timeline", "status": "start"})
     timeline = await asyncio.to_thread(
         build_timeline,
@@ -117,6 +145,12 @@ async def run_pipeline(
         shots,
         speech_regions,
         transcript_segments,
+    )
+    eligible = sum(1 for s in timeline.segments if s.ad_eligible)
+    logger.info(
+        "stage 6/7 timeline done: %d segment(s), %d AD-eligible",
+        len(timeline.segments),
+        eligible,
     )
     await on_event(
         {
@@ -126,9 +160,14 @@ async def run_pipeline(
     )
     await on_event({"type": "stage", "stage": "timeline", "status": "done"})
 
+    logger.info(
+        "stage 6/7 narration: writing AD lines for %d eligible segment(s)", eligible
+    )
     await on_event({"type": "stage", "stage": "narration", "status": "start"})
+    t0 = time.monotonic()
 
     async def _on_segment(segment) -> None:
+        logger.debug("segment %s narration: %r", segment.id, segment.ad_narration)
         await on_event(
             {
                 "type": "narration",
@@ -140,12 +179,27 @@ async def run_pipeline(
     timeline = await fill_narration_gaps(
         timeline, on_segment=_on_segment, client=client
     )
+    logger.info("stage 6/7 narration done in %.1fs", time.monotonic() - t0)
     await on_event({"type": "stage", "stage": "narration", "status": "done"})
 
     # 7. Narration text-to-speech (CPU-bound Kokoro, one clip at a time).
+    logger.info("stage 7/7 tts: synthesizing narration audio")
     await on_event({"type": "stage", "stage": "tts", "status": "start"})
+    t0 = time.monotonic()
 
     async def _on_narration_audio(segment) -> None:
+        if segment.ad_narration_overflow:
+            logger.warning(
+                "segment %s narration overflows its gap (%.2fs clip)",
+                segment.id,
+                segment.ad_narration_duration_sec,
+            )
+        else:
+            logger.debug(
+                "segment %s narration audio: %.2fs",
+                segment.id,
+                segment.ad_narration_duration_sec,
+            )
         await on_event(
             {
                 "type": "narration_audio",
@@ -159,6 +213,7 @@ async def run_pipeline(
     timeline = await synthesize_narration(
         timeline, out_dir=str(narration_dir), on_segment=_on_narration_audio
     )
-    await on_event({"type": "stage", "stage": "tts", "status": "done"})
+    logger.info("stage 7/7 tts done in %.1fs", time.monotonic() - t0)
+    logger.info("pipeline complete: %s", video_path)
 
     return timeline

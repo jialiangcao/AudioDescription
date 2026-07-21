@@ -12,6 +12,7 @@ with ``--workers > 1`` would split jobs across processes.
 
 import contextlib
 import json
+import logging
 import shutil
 import tempfile
 import time
@@ -20,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from timeline import Timeline
+
+logger = logging.getLogger(__name__)
 
 # Single owned root so startup recovery / TTL sweeps can glob only our dirs.
 JOBS_ROOT = Path(tempfile.gettempdir()) / "adesc-jobs"
@@ -89,6 +92,7 @@ class JobStore:
         job = Job(id=job_id, dir=job_dir)
         self._jobs[job_id] = job
         self._persist(job)
+        logger.info("job %s created at %s", job_id, job_dir)
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -107,6 +111,10 @@ class JobStore:
         job.status = status
         if error is not None:
             job.error = error
+        if status == STATUS_ERROR:
+            logger.error("job %s -> %s: %s", job_id, status, error)
+        else:
+            logger.info("job %s -> %s", job_id, status)
         self.publish(job_id, {"type": "status", "status": status, "error": error})
 
     def set_timeline(self, job_id: str, timeline: Timeline) -> None:
@@ -162,6 +170,7 @@ class JobStore:
             self._jobs.pop(job_id, None)
             self._subscribers.pop(job_id, None)
             swept.append(job_id)
+            logger.debug("swept expired job %s (%s)", job_id, job.dir)
         return swept
 
     def recover(self) -> None:
@@ -170,13 +179,16 @@ class JobStore:
         Terminal jobs are restored as-is; jobs that were mid-flight are marked
         ``interrupted`` so status/QA endpoints report cleanly instead of 404ing.
         """
+        recovered = 0
         for status_path in self.root.glob("*/status.json"):
             try:
                 data = json.loads(status_path.read_text())
             except (OSError, json.JSONDecodeError):
+                logger.warning("recover: skipping unreadable %s", status_path)
                 continue
             job_id = data.get("id")
             if not job_id:
+                logger.warning("recover: skipping %s with no job id", status_path)
                 continue
             job_dir = status_path.parent
             timeline = None
@@ -184,9 +196,15 @@ class JobStore:
                 try:
                     timeline = Timeline.model_validate(data["timeline"])
                 except Exception:
+                    logger.warning(
+                        "recover: job %s had an invalid timeline, dropping it", job_id
+                    )
                     timeline = None
             status = data.get("status", STATUS_INTERRUPTED)
             if status in ACTIVE_STATUSES:
+                logger.info(
+                    "recover: job %s was mid-flight, marking interrupted", job_id
+                )
                 status = STATUS_INTERRUPTED
             job = Job(
                 id=job_id,
@@ -199,6 +217,9 @@ class JobStore:
                 updated_at=data.get("updated_at", time.time()),
             )
             self._jobs[job_id] = job
+            recovered += 1
+        if recovered:
+            logger.info("recover: restored %d job(s) from disk", recovered)
 
     # -- persistence ---------------------------------------------------------
 

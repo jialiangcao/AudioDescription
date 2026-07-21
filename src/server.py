@@ -15,6 +15,7 @@ workers, so never pass ``--workers > 1``.
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -37,10 +38,14 @@ from jobs import (
     Job,
     JobStore,
 )
+from log_config import configure_logging
 from pipeline import run_pipeline
 from timeline import Timeline
 
 load_dotenv()
+configure_logging()
+
+logger = logging.getLogger(__name__)
 
 # Number of jobs processed concurrently. Kept small on purpose: the CPU-bound
 # stages (VAD/Whisper/OpenCV) contend for cores, and torch intra-op threads are
@@ -67,6 +72,9 @@ def _get_pipeline_client(app: FastAPI) -> genai.Client:
     """
     client = getattr(app.state, "gemini_client", None)
     if client is None:
+        logger.info(
+            "building shared Gemini client (timeout=%dms)", GEMINI_REQUEST_TIMEOUT_MS
+        )
         client = genai.Client(
             http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS)
         )
@@ -78,12 +86,15 @@ async def _process_job(app: FastAPI, job_id: str) -> None:
     store: JobStore = app.state.store
     job = store.get(job_id)
     if job is None:
+        logger.warning("job %s vanished before processing started", job_id)
         return
     video = job.source_video
     if video is None:
+        logger.error("job %s has no uploaded video on disk", job_id)
         store.set_status(job_id, STATUS_ERROR, error="uploaded video missing")
         return
 
+    logger.info("job %s: starting pipeline for %s", job_id, video.name)
     store.set_status(job_id, STATUS_PROCESSING)
 
     async def on_event(event: dict) -> None:
@@ -97,7 +108,11 @@ async def _process_job(app: FastAPI, job_id: str) -> None:
         timeline = await run_pipeline(video, job.dir, on_event, client=client)
         store.set_timeline(job_id, timeline)
         store.set_status(job_id, STATUS_DONE)
+        logger.info(
+            "job %s: pipeline finished (%d segments)", job_id, len(timeline.segments)
+        )
     except Exception as exc:  # noqa: BLE001 - surface any stage failure to the client
+        logger.exception("job %s: pipeline failed", job_id)
         store.set_status(job_id, STATUS_ERROR, error=f"{type(exc).__name__}: {exc}")
 
 
@@ -115,8 +130,14 @@ async def _sweeper(app: FastAPI) -> None:
     store: JobStore = app.state.store
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_SEC)
-        with contextlib.suppress(Exception):
-            store.sweep(ttl_sec=JOB_TTL_SEC)
+        try:
+            swept = store.sweep(ttl_sec=JOB_TTL_SEC)
+            if swept:
+                logger.info(
+                    "sweeper reclaimed %d expired job dir(s): %s", len(swept), swept
+                )
+        except Exception:
+            logger.exception("sweeper failed to reclaim expired jobs")
 
 
 @contextlib.asynccontextmanager
@@ -134,9 +155,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tasks = [asyncio.create_task(_worker(app)) for _ in range(NUM_WORKERS)]
     tasks.append(asyncio.create_task(_sweeper(app)))
     app.state.background_tasks = tasks
+    logger.info("adesc backend up: %d worker(s) + sweeper", NUM_WORKERS)
     try:
         yield
     finally:
+        logger.info(
+            "adesc backend shutting down, cancelling %d background task(s)", len(tasks)
+        )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -171,10 +196,16 @@ class AskResponse(BaseModel):
 async def create_job(file: UploadFile) -> dict:
     store: JobStore = app.state.store
     if store.at_capacity():
+        logger.warning(
+            "rejecting upload: at capacity (%d active jobs)", store.active_count()
+        )
         raise HTTPException(status_code=503, detail="server busy, too many active jobs")
 
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_VIDEO_SUFFIXES:
+        logger.warning(
+            "rejecting upload %r: unsupported type %r", file.filename, suffix
+        )
         raise HTTPException(
             status_code=400, detail=f"unsupported video type: {suffix or 'unknown'}"
         )
@@ -188,6 +219,12 @@ async def create_job(file: UploadFile) -> dict:
     finally:
         await file.close()
 
+    logger.info(
+        "job %s: queued upload %r (%d bytes)",
+        job.id,
+        file.filename,
+        dest.stat().st_size,
+    )
     await app.state.job_queue.put(job.id)
     return {"job_id": job.id}
 
@@ -237,11 +274,13 @@ async def ask(job_id: str, body: AskRequest) -> AskResponse:
     if job.status != STATUS_DONE or job.timeline is None:
         raise HTTPException(status_code=409, detail="job not finished")
 
+    logger.info("job %s: Q&A question=%r", job_id, body.question)
     try:
         answer = await asyncio.to_thread(
             qa.answer_question, job.timeline, body.question
         )
     except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
+        logger.exception("job %s: Q&A failed", job_id)
         raise HTTPException(
             status_code=500, detail=f"could not answer question: {exc}"
         ) from exc
@@ -253,9 +292,11 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
     store: JobStore = websocket.app.state.store
     if store.get(job_id) is None:
+        logger.warning("ws rejected: unknown job %s", job_id)
         await websocket.close(code=4004)
         return
 
+    logger.debug("ws subscribed to job %s", job_id)
     queue: asyncio.Queue = asyncio.Queue()
     store.subscribe(job_id, queue)
     try:
@@ -268,7 +309,7 @@ async def job_events(websocket: WebSocket, job_id: str) -> None:
             ):
                 break
     except WebSocketDisconnect:
-        pass
+        logger.debug("ws disconnected from job %s", job_id)
     finally:
         store.unsubscribe(job_id, queue)
         with contextlib.suppress(RuntimeError):

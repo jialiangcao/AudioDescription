@@ -1,8 +1,11 @@
+import logging
 import os
 
 import cv2
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
+
+logger = logging.getLogger(__name__)
 
 
 def detect_shots(video_path, threshold=27.0):
@@ -10,6 +13,7 @@ def detect_shots(video_path, threshold=27.0):
 
     Returns a list of (start_sec, end_sec) tuples covering the whole video.
     """
+    logger.debug("detect_shots: %s (threshold=%.1f)", video_path, threshold)
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector(threshold=threshold))
@@ -17,8 +21,13 @@ def detect_shots(video_path, threshold=27.0):
     scene_list = scene_manager.get_scene_list()
 
     if not scene_list:
+        logger.warning(
+            "detect_shots: no cuts found, treating whole video as one shot (%s)",
+            video.duration,
+        )
         return [(0.0, video.duration)]
 
+    logger.debug("detect_shots: %d shot(s) detected", len(scene_list))
     return [(start.seconds, end.seconds) for start, end in scene_list]
 
 
@@ -34,6 +43,13 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    logger.debug(
+        "extract_keyframes: %d shot(s) @ %.2ffps, every %.1fs -> %s",
+        len(shots),
+        fps,
+        interval_sec,
+        out_dir,
+    )
 
     shot_records = []
     for i, (start, end) in enumerate(shots):
@@ -58,6 +74,7 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
             paths.append((t, path))
 
         if not paths:
+            logger.warning("extract_keyframes: shot %d yielded no readable frames", i)
             continue
 
         keyframe = min(paths, key=lambda tp: abs(tp[0] - midpoint))[1]
@@ -72,6 +89,7 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
         )
 
     cap.release()
+    logger.debug("extract_keyframes: produced %d shot record(s)", len(shot_records))
     return shot_records
 
 
