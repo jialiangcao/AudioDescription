@@ -78,3 +78,17 @@ Both Gemini calls (shot description and gap narration) use the same `MODEL` cons
 
 ### Dev tools
 This project uses ruff lint and pyright type checking, ensure there are no errors with either of these in the code you write/edit.
+
+# Testing Rules
+
+- Run unit tests for touched files as you go; full unit+integration+E2E before commit
+- If a test fails, assume the code is wrong, not the test. Only
+  edit a test if the requirement intentionally changed — say so
+  explicitly. Never edit a test just to silence a failure.
+- Bug fix → write a failing regression test first, then fix the code.
+- New logic (conditionals, calculations, parsing, edge cases) →
+  add tests in the same change. Skip trivial glue code.
+- Brittle test (breaks on harmless refactors, checks internals not
+  outcomes) → rewrite to check behavior, and flag it as a refactor.
+- Delete a test only if its feature is gone or it's fully redundant
+  — say which and why.

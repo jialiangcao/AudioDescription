@@ -1,0 +1,136 @@
+import pytest
+
+import timeline as timeline_module
+from timeline import (
+    AudioAnalysis,
+    Segment,
+    Timeline,
+    VisualAnalysis,
+    _overlap_sec,
+    _speech_seconds_within,
+    _transcript_within,
+    build_timeline,
+    load_timeline,
+    save_timeline,
+)
+
+
+def test_overlap_sec_no_overlap():
+    assert _overlap_sec(0.0, 1.0, 2.0, 3.0) == 0.0
+
+
+def test_overlap_sec_partial_overlap():
+    assert _overlap_sec(0.0, 2.0, 1.0, 3.0) == 1.0
+
+
+def test_overlap_sec_full_containment():
+    assert _overlap_sec(0.0, 5.0, 1.0, 2.0) == 1.0
+
+
+def test_speech_seconds_within_sums_multiple_regions():
+    regions = [(0.0, 1.0), (2.0, 3.5), (10.0, 11.0)]
+    assert _speech_seconds_within(0.0, 4.0, regions) == pytest.approx(2.5)
+
+
+def test_transcript_within_joins_overlapping_segments_in_order():
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "hello"},
+        {"start": 5.0, "end": 6.0, "text": "unrelated"},
+        {"start": 1.5, "end": 2.0, "text": "world"},
+    ]
+    assert _transcript_within(0.0, 2.0, segments) == "hello world"
+
+
+def test_transcript_within_returns_none_when_no_overlap():
+    segments = [{"start": 5.0, "end": 6.0, "text": "unrelated"}]
+    assert _transcript_within(0.0, 2.0, segments) is None
+
+
+class _FakeCapture:
+    def __init__(self, fps, frame_count):
+        self._fps = fps
+        self._frame_count = frame_count
+
+    def get(self, prop):
+        if prop == timeline_module.cv2.CAP_PROP_FPS:
+            return self._fps
+        if prop == timeline_module.cv2.CAP_PROP_FRAME_COUNT:
+            return self._frame_count
+        return 0
+
+    def release(self):
+        pass
+
+
+def _shot(id_, start, end):
+    return {
+        "id": id_,
+        "start": start,
+        "end": end,
+        "keyframe": f"shot_{id_:04d}.jpg",
+        "visual": {
+            "description": f"description {id_}",
+            "entities": [],
+            "setting": "a setting",
+            "on_screen_text": None,
+        },
+    }
+
+
+def test_build_timeline_computes_duration_and_ad_eligibility(monkeypatch):
+    monkeypatch.setattr(
+        timeline_module.cv2,
+        "VideoCapture",
+        lambda path: _FakeCapture(fps=10.0, frame_count=40),
+    )
+
+    shots = [_shot(0, 0.0, 2.2), _shot(1, 2.2, 4.0)]
+    speech_regions = [(2.2, 3.0)]
+    transcript_segments = [{"start": 2.2, "end": 3.0, "text": "hello"}]
+
+    tl = build_timeline("video.mp4", shots, speech_regions, transcript_segments)
+
+    assert tl.duration_sec == 4.0
+    assert len(tl.segments) == 2
+
+    first, second = tl.segments
+    assert first.audio is not None
+    assert first.audio.has_speech is False
+    assert first.audio.transcript is None
+    # fully silent 2.2s shot clears the 2.0s narratable-gap threshold
+    assert first.ad_eligible is True
+
+    assert second.audio is not None
+    assert second.audio.has_speech is True
+    assert second.audio.transcript == "hello"
+    # 0.8s of speech in a 1.8s shot leaves only ~1.0s of gap, below threshold
+    assert second.ad_eligible is False
+
+
+def test_save_and_load_timeline_roundtrip(tmp_path):
+    tl = Timeline(
+        video_id="video.mp4",
+        duration_sec=4.0,
+        segments=[
+            Segment(
+                id=0,
+                start=0.0,
+                end=2.0,
+                keyframe="shot_0000.jpg",
+                visual=VisualAnalysis(
+                    description="d", entities=[], setting="s", on_screen_text=None
+                ),
+                audio=AudioAnalysis(
+                    has_speech=False, transcript=None, silence_ratio=1.0
+                ),
+                ad_eligible=True,
+                narratable_gap_sec=2.0,
+            )
+        ],
+    )
+
+    out_path = tmp_path / "timeline.json"
+    save_timeline(tl, out_path=str(out_path))
+    loaded = load_timeline(str(out_path))
+
+    assert loaded == tl
