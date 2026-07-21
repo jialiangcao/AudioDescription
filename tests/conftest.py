@@ -58,26 +58,46 @@ class FakeGeminiResponse:
         self.text = text
 
 
+def _canned_response(config):
+    """Shot-analysis calls (config.response_schema set) get canned JSON matching
+    ShotAnalysis; narration calls (no schema) get a canned sentence."""
+    if getattr(config, "response_schema", None) is not None:
+        return FakeGeminiResponse(
+            '{"description": "a test scene", "entities": ["object"], '
+            '"setting": "a test setting", "on_screen_text": null}'
+        )
+    return FakeGeminiResponse("A quiet moment unfolds on screen.")
+
+
+class _FakeAsyncModels:
+    def __init__(self, calls):
+        self._calls = calls
+
+    async def generate_content(self, model, contents, config=None):
+        self._calls.append((model, contents, config))
+        return _canned_response(config)
+
+
+class _FakeAio:
+    def __init__(self, calls):
+        self.models = _FakeAsyncModels(calls)
+
+
 class FakeGeminiClient:
     """Stand-in for google.genai.Client that avoids real network calls.
 
-    Shot-analysis calls (config.response_schema set) get back canned JSON
-    matching ShotAnalysis; narration calls (no schema) get back a canned
-    sentence.
+    Exposes both the sync ``.models.generate_content`` (used by qa.py) and the
+    async ``.aio.models.generate_content`` (used by vision_analysis.py).
     """
 
     def __init__(self):
         self.models = self
         self.calls = []
+        self.aio = _FakeAio(self.calls)
 
     def generate_content(self, model, contents, config=None):
         self.calls.append((model, contents, config))
-        if getattr(config, "response_schema", None) is not None:
-            return FakeGeminiResponse(
-                '{"description": "a test scene", "entities": ["object"], '
-                '"setting": "a test setting", "on_screen_text": null}'
-            )
-        return FakeGeminiResponse("A quiet moment unfolds on screen.")
+        return _canned_response(config)
 
 
 @pytest.fixture

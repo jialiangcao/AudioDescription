@@ -1,13 +1,20 @@
+import asyncio
+from collections.abc import Awaitable, Callable
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
-from timeline import NARRATION_WORDS_PER_SEC
+from timeline import NARRATION_WORDS_PER_SEC, Segment, Timeline
 
 load_dotenv()
 
 MODEL = "gemini-2.5-flash"
+
+# How many Gemini calls to keep in flight at once within a single job's
+# shot-analysis / narration loop.
+DEFAULT_CONCURRENCY = 4
 
 
 class ShotAnalysis(BaseModel):
@@ -17,11 +24,11 @@ class ShotAnalysis(BaseModel):
     on_screen_text: str | None
 
 
-def analyze_keyframe(client, keyframe_path):
+async def analyze_keyframe(client, keyframe_path):
     with open(keyframe_path, "rb") as f:
         image_bytes = f.read()
 
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=MODEL,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
@@ -39,10 +46,30 @@ def analyze_keyframe(client, keyframe_path):
     return ShotAnalysis.model_validate_json(response.text).model_dump()
 
 
-def analyze_shots(shots):
-    client = genai.Client()
-    for shot in shots:
-        shot["visual"] = analyze_keyframe(client, shot["keyframe"])
+async def analyze_shots(
+    shots,
+    on_shot: Callable[[dict], Awaitable[None]] | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    client=None,
+):
+    """Attach a ``visual`` analysis to every shot via Gemini, concurrently.
+
+    Shots are analyzed with up to ``concurrency`` Gemini calls in flight at
+    once; ``on_shot`` (if given) is awaited with each shot as its analysis
+    completes, so callers can stream results. Completion order is not shot
+    order, so consumers must key off ``shot["id"]``.
+    """
+    client = client or genai.Client()
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run(shot):
+        async with semaphore:
+            shot["visual"] = await analyze_keyframe(client, shot["keyframe"])
+        if on_shot is not None:
+            await on_shot(shot)
+        return shot
+
+    await asyncio.gather(*(_run(shot) for shot in shots))
     return shots
 
 
@@ -56,7 +83,7 @@ def _neighbor_transcript(segments, index):
     return None
 
 
-def generate_narration(client, segment, max_words, neighbor_transcript=None):
+async def generate_narration(client, segment, max_words, neighbor_transcript=None):
     context = f"Scene: {segment.visual.description}"
     if segment.visual.on_screen_text:
         context += f"\nOn-screen text: {segment.visual.on_screen_text}"
@@ -76,7 +103,7 @@ def generate_narration(client, segment, max_words, neighbor_transcript=None):
         "action and setting directly. Return only the narration text, nothing else."
     )
 
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=MODEL,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
@@ -90,17 +117,39 @@ def generate_narration(client, segment, max_words, neighbor_transcript=None):
     return response.text.strip()
 
 
-def fill_narration_gaps(timeline, words_per_sec=None):
-    words_per_sec = words_per_sec or NARRATION_WORDS_PER_SEC
-    client = genai.Client()
+async def fill_narration_gaps(
+    timeline: Timeline,
+    on_segment: Callable[[Segment], Awaitable[None]] | None = None,
+    words_per_sec: float | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    client=None,
+):
+    """Generate AD narration for every ``ad_eligible`` segment, concurrently.
 
-    for i, segment in enumerate(timeline.segments):
-        if not segment.ad_eligible:
-            continue
+    ``on_segment`` (if given) is awaited with each segment as its narration
+    completes. Completion order is not segment order, so consumers must key
+    off ``segment.id``.
+    """
+    words_per_sec = words_per_sec or NARRATION_WORDS_PER_SEC
+    client = client or genai.Client()
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run(i, segment):
         max_words = max(3, int(segment.narratable_gap_sec * words_per_sec))
         neighbor_transcript = _neighbor_transcript(timeline.segments, i)
-        segment.ad_narration = generate_narration(
-            client, segment, max_words, neighbor_transcript
+        async with semaphore:
+            segment.ad_narration = await generate_narration(
+                client, segment, max_words, neighbor_transcript
+            )
+        if on_segment is not None:
+            await on_segment(segment)
+
+    await asyncio.gather(
+        *(
+            _run(i, segment)
+            for i, segment in enumerate(timeline.segments)
+            if segment.ad_eligible
         )
+    )
 
     return timeline

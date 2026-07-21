@@ -1,39 +1,38 @@
 import pytest
 
-import main
-import vision_analysis
-from timeline import MIN_NARRATABLE_GAP_SEC, load_timeline
+import pipeline
+from pipeline import run_pipeline
+from timeline import MIN_NARRATABLE_GAP_SEC
 
 
-def test_process_video_end_to_end(
+async def test_run_pipeline_end_to_end(
     tmp_path, monkeypatch, synthetic_video, fake_gemini_client
 ):
-    """Runs the real pipeline glue in main.process_video() over a small
+    """Runs the real pipeline glue in pipeline.run_pipeline() over a small
     synthetic clip, stubbing only the external ML/API boundaries (Gemini,
     VAD, Whisper) that would otherwise need network access or slow model
     downloads. Segmentation, audio extraction, and timeline assembly all run
     for real.
     """
-    monkeypatch.setattr(vision_analysis.genai, "Client", lambda: fake_gemini_client)
-    monkeypatch.setattr(main, "detect_speech_regions", lambda audio_path: [])
-    monkeypatch.setattr(main, "transcribe", lambda audio_path, speech_regions: [])
+    monkeypatch.setattr(pipeline, "detect_speech_regions", lambda audio_path: [])
+    monkeypatch.setattr(pipeline, "transcribe", lambda audio_path, regions: [])
 
-    frames_dir = tmp_path / "frames"
-    audio_path = tmp_path / "audio.wav"
-    timeline_path = tmp_path / "timeline.json"
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
 
-    timeline = main.process_video(
-        synthetic_video,
-        frames_dir=str(frames_dir),
-        audio_path=str(audio_path),
-        timeline_path=str(timeline_path),
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    timeline = await run_pipeline(
+        synthetic_video, job_dir, on_event, client=fake_gemini_client
     )
 
     assert timeline.video_id == synthetic_video
     assert timeline.duration_sec == pytest.approx(4.0, abs=0.2)
     assert len(timeline.segments) == 2
-    assert audio_path.exists()
-    assert timeline_path.exists()
+    assert (job_dir / "audio.wav").exists()
 
     for segment in timeline.segments:
         # Gemini call was stubbed; every shot gets the same canned analysis.
@@ -54,5 +53,51 @@ def test_process_video_end_to_end(
 
     assert any(segment.ad_eligible for segment in timeline.segments)
 
-    reloaded = load_timeline(str(timeline_path))
-    assert reloaded == timeline
+    # Live progress was streamed: stage markers, per-shot vision, and a
+    # full-timeline snapshot all showed up as events.
+    stages = {e["stage"] for e in events if e.get("type") == "stage"}
+    assert {"segmentation", "vision", "audio", "timeline", "narration"} <= stages
+    assert sum(1 for e in events if e.get("type") == "shot") == 2
+    assert any(e.get("type") == "timeline" for e in events)
+
+
+async def test_run_pipeline_handles_video_without_audio(
+    tmp_path, monkeypatch, synthetic_video, fake_gemini_client
+):
+    """A source with no audio track skips VAD/transcription and still yields a
+    full timeline (ad_eligible computed from shot duration alone)."""
+    from audio_extract import NoAudioStreamError
+
+    def _no_audio(video_path, out_path):
+        raise NoAudioStreamError("no audio")
+
+    monkeypatch.setattr(pipeline, "extract_audio", _no_audio)
+
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("audio stages must be skipped when there is no audio")
+
+    monkeypatch.setattr(pipeline, "detect_speech_regions", _should_not_run)
+    monkeypatch.setattr(pipeline, "transcribe", _should_not_run)
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    timeline = await run_pipeline(
+        synthetic_video, job_dir, on_event, client=fake_gemini_client
+    )
+
+    assert len(timeline.segments) == 2
+    for segment in timeline.segments:
+        assert segment.audio is not None
+        assert segment.audio.has_speech is False
+        assert segment.audio.silence_ratio == 1.0
+
+    audio_done = [
+        e for e in events if e.get("stage") == "audio" and e.get("status") == "done"
+    ]
+    assert audio_done and audio_done[0]["has_audio"] is False

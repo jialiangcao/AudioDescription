@@ -1,4 +1,3 @@
-import vision_analysis
 from timeline import AudioAnalysis, Segment, Timeline, VisualAnalysis
 from vision_analysis import (
     _neighbor_transcript,
@@ -42,11 +41,11 @@ def test_neighbor_transcript_none_when_no_neighbors_have_transcript():
     assert _neighbor_transcript(segments, 1) is None
 
 
-def test_analyze_keyframe_parses_gemini_response(tmp_path, fake_gemini_client):
+async def test_analyze_keyframe_parses_gemini_response(tmp_path, fake_gemini_client):
     keyframe = tmp_path / "frame.jpg"
     keyframe.write_bytes(b"fake-image-bytes")
 
-    result = analyze_keyframe(fake_gemini_client, str(keyframe))
+    result = await analyze_keyframe(fake_gemini_client, str(keyframe))
 
     assert result == {
         "description": "a test scene",
@@ -56,25 +55,39 @@ def test_analyze_keyframe_parses_gemini_response(tmp_path, fake_gemini_client):
     }
 
 
-def test_analyze_shots_populates_visual_field(
-    tmp_path, monkeypatch, fake_gemini_client
-):
-    monkeypatch.setattr(vision_analysis.genai, "Client", lambda: fake_gemini_client)
-
+async def test_analyze_shots_populates_visual_field(tmp_path, fake_gemini_client):
     keyframe = tmp_path / "frame.jpg"
     keyframe.write_bytes(b"fake-image-bytes")
 
-    shots = analyze_shots([{"id": 0, "keyframe": str(keyframe)}])
+    shots = await analyze_shots(
+        [{"id": 0, "keyframe": str(keyframe)}], client=fake_gemini_client
+    )
 
     assert shots[0]["visual"]["description"] == "a test scene"
     assert shots[0]["visual"]["entities"] == ["object"]
 
 
-def test_fill_narration_gaps_only_fills_eligible_segments(
-    tmp_path, monkeypatch, fake_gemini_client
+async def test_analyze_shots_streams_each_shot_via_callback(
+    tmp_path, fake_gemini_client
 ):
-    monkeypatch.setattr(vision_analysis.genai, "Client", lambda: fake_gemini_client)
+    keyframe = tmp_path / "frame.jpg"
+    keyframe.write_bytes(b"fake-image-bytes")
 
+    seen = []
+
+    async def on_shot(shot):
+        seen.append(shot["id"])
+
+    shots = [{"id": i, "keyframe": str(keyframe)} for i in range(3)]
+    await analyze_shots(shots, on_shot=on_shot, client=fake_gemini_client)
+
+    # every shot is reported, regardless of completion order
+    assert sorted(seen) == [0, 1, 2]
+
+
+async def test_fill_narration_gaps_only_fills_eligible_segments(
+    tmp_path, fake_gemini_client
+):
     keyframe = tmp_path / "frame.jpg"
     keyframe.write_bytes(b"fake-image-bytes")
 
@@ -86,7 +99,7 @@ def test_fill_narration_gaps_only_fills_eligible_segments(
     )
     tl = Timeline(video_id="v", duration_sec=2.0, segments=[eligible, ineligible])
 
-    result = fill_narration_gaps(tl)
+    result = await fill_narration_gaps(tl, client=fake_gemini_client)
 
     assert result.segments[0].ad_narration == "A quiet moment unfolds on screen."
     assert result.segments[1].ad_narration is None

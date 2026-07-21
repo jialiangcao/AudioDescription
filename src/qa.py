@@ -1,3 +1,5 @@
+import logging
+import threading
 from collections.abc import Callable
 from typing import cast
 
@@ -13,11 +15,29 @@ from timeline import Timeline
 
 load_dotenv()
 
-client = genai.Client()
+logger = logging.getLogger(__name__)
+
 MODEL = "gemini-2.5-flash"
 
 # Number of CLIP-retrieved frames sent to the VLM in a single batch.
 TOP_K_FRAMES = 10
+
+# Per-request timeout (ms), matching the pipeline client's (server.py) so a
+# hung Gemini call during /ask can't pin a thread-pool slot forever.
+GEMINI_REQUEST_TIMEOUT_MS = 120_000
+
+_CLIENT = None
+_RETRIEVER = None
+_RETRIEVER_LOCK = threading.Lock()
+
+
+def _load_client():
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = genai.Client(
+            http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS)
+        )
+    return _CLIENT
 
 
 class UseVlmDecision(BaseModel):
@@ -31,7 +51,7 @@ def _pick_device() -> torch.device:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    print(f"[qa] auto-selected device: {device}")
+    logger.info("auto-selected device: %s", device)
     return device
 
 
@@ -43,7 +63,7 @@ class ClipFrameRetriever:
         device: str | None = None,
     ):
         self.device = torch.device(device) if device else _pick_device()
-        print(f"[qa] loading CLIP model {model_name!r} (pretrained={pretrained!r})...")
+        logger.info("loading CLIP model %r (pretrained=%r)...", model_name, pretrained)
         model, _, preprocess = open_clip.create_model_and_transforms(
             model_name, pretrained=pretrained
         )
@@ -53,7 +73,7 @@ class ClipFrameRetriever:
         self.model = cast(open_clip.CLIP, model).to(self.device).eval()
         self.preprocess = cast(Callable[[Image.Image], torch.Tensor], preprocess)
         self.tokenizer = open_clip.get_tokenizer(model_name)
-        print(f"[qa] CLIP model ready on {self.device}")
+        logger.info("CLIP model ready on %s", self.device)
 
     @torch.no_grad()
     def encode_images(
@@ -61,16 +81,18 @@ class ClipFrameRetriever:
     ) -> torch.Tensor:
         """Returns L2-normalized image embeddings, shape (N, D)."""
         if not image_paths:
-            print("[qa] encode_images: no paths given, skipping")
+            logger.debug("encode_images: no paths given, skipping")
             return torch.empty(0)
 
-        print(
-            f"[qa] encode_images: embedding {len(image_paths)} frames (batch_size={batch_size})"
+        logger.debug(
+            "encode_images: embedding %d frames (batch_size=%d)",
+            len(image_paths),
+            batch_size,
         )
         all_feats = []
         for i in range(0, len(image_paths), batch_size):
             batch_paths = image_paths[i : i + batch_size]
-            print(f"[qa]   batch {i // batch_size}: {len(batch_paths)} frames")
+            logger.debug("  batch %d: %d frames", i // batch_size, len(batch_paths))
             images = torch.stack(
                 [self.preprocess(Image.open(p).convert("RGB")) for p in batch_paths]
             ).to(self.device)
@@ -79,13 +101,13 @@ class ClipFrameRetriever:
             all_feats.append(feats.cpu())
 
         result = torch.cat(all_feats, dim=0)
-        print(f"[qa] encode_images: done, embeddings shape={tuple(result.shape)}")
+        logger.debug("encode_images: done, embeddings shape=%s", tuple(result.shape))
         return result
 
     @torch.no_grad()
     def encode_text(self, texts: list[str]) -> torch.Tensor:
         """Returns L2-normalized text embeddings, shape (N, D)."""
-        print(f"[qa] encode_text: embedding {len(texts)} text(s): {texts!r}")
+        logger.debug("encode_text: embedding %d text(s): %r", len(texts), texts)
         tokens = self.tokenizer(texts).to(self.device)
         feats = self.model.encode_text(tokens)
         feats = feats / feats.norm(dim=-1, keepdim=True)
@@ -103,7 +125,7 @@ class ClipFrameRetriever:
         [(frame_index, similarity), ...] sorted descending, length min(top_k, N).
         """
         if image_features.nelement() == 0 or text_features.nelement() == 0:
-            print("[qa] similarity_top_k: empty features, returning no matches")
+            logger.debug("similarity_top_k: empty features, returning no matches")
             return []
 
         k = min(top_k, image_features.shape[0])
@@ -113,8 +135,11 @@ class ClipFrameRetriever:
             (int(idx.item()), float(val.item()))
             for idx, val in zip(topk_indices, topk_values, strict=True)
         ]
-        print(
-            f"[qa] similarity_top_k: top-{k} of {image_features.shape[0]} frames, scores={[round(s, 4) for _, s in ranked]}"
+        logger.debug(
+            "similarity_top_k: top-%d of %d frames, scores=%s",
+            k,
+            image_features.shape[0],
+            [round(s, 4) for _, s in ranked],
         )
         return ranked
 
@@ -129,24 +154,29 @@ class ClipFrameRetriever:
         End-to-end: embed all frames + the text query, return the top_k most
         similar frames as (path, similarity) sorted descending.
         """
-        print(
-            f"[qa] retrieve: query={query!r} over {len(frame_paths)} candidate frames"
+        logger.debug(
+            "retrieve: query=%r over %d candidate frames", query, len(frame_paths)
         )
         image_features = self.encode_images(frame_paths, batch_size)
         text_features = self.encode_text([query])
         ranked = self.similarity_top_k(image_features, text_features, top_k=top_k)
         results = [(frame_paths[i], score) for i, score in ranked]
-        print(f"[qa] retrieve: selected {len(results)} frame(s):")
+        logger.debug("retrieve: selected %d frame(s):", len(results))
         for path, score in results:
-            print(f"[qa]   {score:.4f}  {path}")
+            logger.debug("  %.4f  %s", score, path)
         return results
 
 
-retriever = ClipFrameRetriever()
+def _load_retriever() -> "ClipFrameRetriever":
+    global _RETRIEVER
+    if _RETRIEVER is None:
+        _RETRIEVER = ClipFrameRetriever()
+    return _RETRIEVER
 
 
 def should_use_vlm(question: str) -> bool:
-    print(f"[qa] should_use_vlm: asking {MODEL} to route question={question!r}")
+    logger.debug("should_use_vlm: asking %s to route question=%r", MODEL, question)
+    client = _load_client()
     response = client.models.generate_content(
         model=MODEL,
         contents=(
@@ -165,14 +195,16 @@ def should_use_vlm(question: str) -> bool:
     if response.text is None:
         raise RuntimeError(f"{MODEL} returned no text for should_use_vlm routing")
     result = UseVlmDecision.model_validate_json(response.text)
-    print(
-        f"[qa] should_use_vlm: routed to {'VLM + CLIP' if result.use_vlm else 'CLIP only'}"
+    logger.debug(
+        "should_use_vlm: routed to %s", "VLM + CLIP" if result.use_vlm else "CLIP only"
     )
     return result.use_vlm
 
 
 def _ask_vlm(question: str, frame_paths: list[str]) -> str:
-    print(f"[qa] _ask_vlm: sending {len(frame_paths)} frame(s) + question to {MODEL}")
+    logger.debug(
+        "_ask_vlm: sending %d frame(s) + question to %s", len(frame_paths), MODEL
+    )
     contents = []
     for path in frame_paths:
         with open(path, "rb") as f:
@@ -180,6 +212,7 @@ def _ask_vlm(question: str, frame_paths: list[str]) -> str:
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
     contents.append(question)
 
+    client = _load_client()
     response = client.models.generate_content(
         model=MODEL,
         contents=contents,
@@ -188,20 +221,28 @@ def _ask_vlm(question: str, frame_paths: list[str]) -> str:
     if response.text is None:
         raise RuntimeError(f"{MODEL} returned no text for _ask_vlm")
     answer = response.text.strip()
-    print(f"[qa] _ask_vlm: answer ({len(answer)} chars): {answer!r}")
+    logger.debug("_ask_vlm: answer (%d chars): %r", len(answer), answer)
     return answer
 
 
 def answer_question(timeline: Timeline, question: str) -> str:
     frame_paths = [path for seg in timeline.segments for path in seg.keyframes]
-    print(
-        f"[qa] answer_question: question={question!r} over {len(frame_paths)} total frames"
+    logger.info(
+        "answer_question: question=%r over %d total frames",
+        question,
+        len(frame_paths),
     )
-    top_frames = retriever.retrieve(frame_paths, question, top_k=TOP_K_FRAMES)
+    # CLIP inference runs on a shared, single retriever instance; serialize
+    # access so concurrent /ask requests don't submit into the same model at
+    # once (MPS in particular is not battle-tested under concurrent use).
+    with _RETRIEVER_LOCK:
+        top_frames = _load_retriever().retrieve(
+            frame_paths, question, top_k=TOP_K_FRAMES
+        )
 
     if should_use_vlm(question):
         raise NotImplementedError("VLM reasoning path is not yet implemented")
 
     answer = _ask_vlm(question, [path for path, _ in top_frames])
-    print(f"[qa] answer_question: final answer={answer!r}")
+    logger.info("answer_question: final answer=%r", answer)
     return answer
