@@ -41,6 +41,10 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
     frames.mkdir(parents=True, exist_ok=True)
     (frames / "shot_0000_00.jpg").write_bytes(b"fake-jpeg")
 
+    narration = job_dir / "narration"
+    narration.mkdir(parents=True, exist_ok=True)
+    (narration / "shot_0000.wav").write_bytes(b"fake-wav")
+
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
     await on_event(
         {
@@ -51,6 +55,19 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
     tl = _timeline()
     await on_event({"type": "timeline", "timeline": tl.model_dump()})
     await on_event({"type": "narration", "segment_id": 0, "text": "canned narration"})
+    tl.segments[0].ad_narration = "canned narration"
+    tl.segments[0].ad_narration_audio = str(narration / "shot_0000.wav")
+    tl.segments[0].ad_narration_duration_sec = 1.5
+    tl.segments[0].ad_narration_overflow = False
+    await on_event(
+        {
+            "type": "narration_audio",
+            "segment_id": 0,
+            "audio": "shot_0000.wav",
+            "duration_sec": 1.5,
+            "overflow": False,
+        }
+    )
     return tl
 
 
@@ -164,4 +181,31 @@ def test_frames_rejects_traversal_and_non_jpg(client, bad_name):
     _wait_status(client, job_id, "done")
 
     resp = client.get(f"/api/jobs/{job_id}/frames/{bad_name}")
+    assert resp.status_code == 404
+
+
+def test_narration_serves_wav(client):
+    job_id = _upload(client).json()["job_id"]
+    _wait_status(client, job_id, "done")
+
+    resp = client.get(f"/api/jobs/{job_id}/narration/shot_0000.wav")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/wav"
+    assert resp.content == b"fake-wav"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "../../etc/passwd",
+        "..%2f..%2fsecret.wav",
+        "shot_0000.mp3",
+        "not-a-clip.txt",
+    ],
+)
+def test_narration_rejects_traversal_and_non_wav(client, bad_name):
+    job_id = _upload(client).json()["job_id"]
+    _wait_status(client, job_id, "done")
+
+    resp = client.get(f"/api/jobs/{job_id}/narration/{bad_name}")
     assert resp.status_code == 404

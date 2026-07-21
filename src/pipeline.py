@@ -17,6 +17,7 @@ from audio_extract import NoAudioStreamError, extract_audio
 from segmentation import segment_video
 from timeline import Timeline, build_timeline
 from transcription import transcribe
+from tts import synthesize_narration
 from vision_analysis import analyze_shots, fill_narration_gaps
 from voice_activity import detect_speech_regions
 
@@ -46,13 +47,15 @@ async def run_pipeline(
 
     ``on_event`` is awaited on the event loop with dict events: ``stage``
     (start/done markers), ``shot`` (per-shot vision result), ``timeline`` (the
-    assembled timeline before narration), and ``narration`` (per-segment AD
-    text). Shot and narration events arrive out of order — consumers must key
-    off the ``id`` field.
+    assembled timeline before narration), ``narration`` (per-segment AD text),
+    and ``narration_audio`` (per-segment synthesized clip: filename, duration,
+    overflow). Shot and narration events arrive out of order — consumers must
+    key off the ``id`` field.
     """
     video_path = Path(video_path)
     frames_dir = job_dir / "frames"
     audio_path = job_dir / "audio.wav"
+    narration_dir = job_dir / "narration"
 
     # 1. Shot segmentation (CPU-bound: PySceneDetect + OpenCV).
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
@@ -138,5 +141,24 @@ async def run_pipeline(
         timeline, on_segment=_on_segment, client=client
     )
     await on_event({"type": "stage", "stage": "narration", "status": "done"})
+
+    # 7. Narration text-to-speech (CPU-bound Kokoro, one clip at a time).
+    await on_event({"type": "stage", "stage": "tts", "status": "start"})
+
+    async def _on_narration_audio(segment) -> None:
+        await on_event(
+            {
+                "type": "narration_audio",
+                "segment_id": segment.id,
+                "audio": Path(segment.ad_narration_audio).name,
+                "duration_sec": segment.ad_narration_duration_sec,
+                "overflow": segment.ad_narration_overflow,
+            }
+        )
+
+    timeline = await synthesize_narration(
+        timeline, out_dir=str(narration_dir), on_segment=_on_narration_audio
+    )
+    await on_event({"type": "stage", "stage": "tts", "status": "done"})
 
     return timeline

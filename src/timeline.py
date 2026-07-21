@@ -35,6 +35,11 @@ class Segment(BaseModel):
     narratable_gap_sec: float | None = None
     # Populated by vision_analysis.fill_narration_gaps for ad_eligible segments.
     ad_narration: str | None = None
+    # Populated by tts.synthesize_narration for segments with ad_narration set.
+    # ad_narration_audio is the server-side path to the synthesized WAV clip.
+    ad_narration_audio: str | None = None
+    ad_narration_duration_sec: float | None = None
+    ad_narration_overflow: bool | None = None
 
 
 class Timeline(BaseModel):

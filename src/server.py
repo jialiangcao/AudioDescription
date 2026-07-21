@@ -216,6 +216,19 @@ async def get_frame(job_id: str, filename: str) -> FileResponse:
     return FileResponse(target, media_type="image/jpeg")
 
 
+@app.get("/api/jobs/{job_id}/narration/{filename}")
+async def get_narration(job_id: str, filename: str) -> FileResponse:
+    job = _require_job(app, job_id)
+    if not filename.endswith(".wav"):
+        raise HTTPException(status_code=404, detail="not found")
+
+    narration_dir = (job.dir / "narration").resolve()
+    target = (narration_dir / filename).resolve()
+    if not target.is_relative_to(narration_dir) or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target, media_type="audio/wav")
+
+
 @app.post("/api/jobs/{job_id}/ask")
 async def ask(job_id: str, body: AskRequest) -> AskResponse:
     job = _require_job(app, job_id)

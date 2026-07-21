@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 
+import numpy as np
 import pytest
 
 
@@ -103,3 +104,22 @@ class FakeGeminiClient:
 @pytest.fixture
 def fake_gemini_client():
     return FakeGeminiClient()
+
+
+class FakeKokoroPipeline:
+    """Stand-in for kokoro.KPipeline that avoids downloading the real model.
+
+    Returns 1s of silence per call — short enough to fit the synthetic clip's
+    ~2s gaps without triggering the overflow retry — so tts.synthesize_narration
+    runs its real file-writing/streaming glue over stubbed inference.
+    """
+
+    def __call__(self, text, voice, speed):
+        yield "gs", "ps", np.zeros(24000, dtype=np.float32)
+
+
+@pytest.fixture
+def fake_kokoro(monkeypatch):
+    import tts
+
+    monkeypatch.setattr(tts, "_load_pipeline", lambda: FakeKokoroPipeline())

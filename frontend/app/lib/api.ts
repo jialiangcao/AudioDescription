@@ -16,6 +16,10 @@ export function frameUrl(jobId: string, keyframePath: string): string {
   return `${API_BASE}/api/jobs/${jobId}/frames/${basename(keyframePath)}`;
 }
 
+export function narrationUrl(jobId: string, audioPath: string): string {
+  return `${API_BASE}/api/jobs/${jobId}/narration/${basename(audioPath)}`;
+}
+
 export interface VisualAnalysis {
   description: string;
   entities: string[];
@@ -39,6 +43,10 @@ export interface Segment {
   ad_eligible: boolean | null;
   narratable_gap_sec: number | null;
   ad_narration: string | null;
+  // Server-side path to the synthesized narration WAV; pass through narrationUrl().
+  ad_narration_audio: string | null;
+  ad_narration_duration_sec: number | null;
+  ad_narration_overflow: boolean | null;
 }
 
 export interface Timeline {
@@ -59,6 +67,13 @@ export type PipelineEvent =
   | { type: "shot"; shot: Partial<Segment> & { id: number } }
   | { type: "timeline"; timeline: Timeline }
   | { type: "narration"; segment_id: number; text: string }
+  | {
+      type: "narration_audio";
+      segment_id: number;
+      audio: string;
+      duration_sec: number | null;
+      overflow: boolean | null;
+    }
   | { type: "status"; status: JobStatus; error: string | null };
 
 export async function uploadVideo(file: File): Promise<string> {

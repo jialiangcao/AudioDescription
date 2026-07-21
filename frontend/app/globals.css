@@ -155,6 +155,22 @@ h1 {
   color: var(--accent);
 }
 
+.badge.overflow {
+  background: #5a1f1f;
+  color: #ffb4b4;
+}
+
+.narration-audio {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.narration-audio audio {
+  height: 32px;
+}
+
 .narration {
   margin-top: 8px;
   padding: 8px 12px;

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   askQuestion,
   frameUrl,
+  narrationUrl,
   uploadVideo,
   wsBase,
   type JobStatus,
@@ -11,13 +12,21 @@ import {
   type Segment,
 } from "./lib/api";
 
-const STAGE_ORDER = ["segmentation", "vision", "audio", "timeline", "narration"];
+const STAGE_ORDER = [
+  "segmentation",
+  "vision",
+  "audio",
+  "timeline",
+  "narration",
+  "tts",
+];
 const STAGE_LABELS: Record<string, string> = {
   segmentation: "Shots",
   vision: "Vision",
   audio: "Audio",
   timeline: "Timeline",
   narration: "Narration",
+  tts: "Voice",
 };
 
 export default function Home() {
@@ -90,6 +99,17 @@ export default function Home() {
             [event.segment_id]: {
               ...prev[event.segment_id],
               ad_narration: event.text,
+            },
+          }));
+          break;
+        case "narration_audio":
+          setSegments((prev) => ({
+            ...prev,
+            [event.segment_id]: {
+              ...prev[event.segment_id],
+              ad_narration_audio: event.audio,
+              ad_narration_duration_sec: event.duration_sec,
+              ad_narration_overflow: event.overflow,
             },
           }));
           break;
@@ -215,6 +235,19 @@ export default function Home() {
             ) : null}
             {seg.ad_narration ? (
               <div className="narration">🎙 {seg.ad_narration}</div>
+            ) : null}
+            {seg.ad_narration_audio ? (
+              <div className="narration-audio">
+                <audio
+                  controls
+                  src={narrationUrl(jobId!, seg.ad_narration_audio)}
+                />
+                {seg.ad_narration_overflow ? (
+                  <span className="badge overflow" title="Clip runs longer than the gap">
+                    overflow
+                  </span>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </div>

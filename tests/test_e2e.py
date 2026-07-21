@@ -6,13 +6,13 @@ from timeline import MIN_NARRATABLE_GAP_SEC
 
 
 async def test_run_pipeline_end_to_end(
-    tmp_path, monkeypatch, synthetic_video, fake_gemini_client
+    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
 ):
     """Runs the real pipeline glue in pipeline.run_pipeline() over a small
     synthetic clip, stubbing only the external ML/API boundaries (Gemini,
-    VAD, Whisper) that would otherwise need network access or slow model
-    downloads. Segmentation, audio extraction, and timeline assembly all run
-    for real.
+    VAD, Whisper, Kokoro) that would otherwise need network access or slow
+    model downloads. Segmentation, audio extraction, timeline assembly, and
+    narration synthesis all run for real.
     """
     monkeypatch.setattr(pipeline, "detect_speech_regions", lambda audio_path: [])
     monkeypatch.setattr(pipeline, "transcribe", lambda audio_path, regions: [])
@@ -48,21 +48,35 @@ async def test_run_pipeline_end_to_end(
         )
         if segment.ad_eligible:
             assert segment.ad_narration == "A quiet moment unfolds on screen."
+            # Narration was synthesized to a real WAV that fits the gap.
+            assert segment.ad_narration_audio is not None
+            assert (job_dir / "narration" / "shot_0000.wav").exists()
+            assert segment.ad_narration_duration_sec == 1.0
+            assert segment.ad_narration_overflow is False
         else:
             assert segment.ad_narration is None
+            assert segment.ad_narration_audio is None
 
     assert any(segment.ad_eligible for segment in timeline.segments)
 
-    # Live progress was streamed: stage markers, per-shot vision, and a
-    # full-timeline snapshot all showed up as events.
+    # Live progress was streamed: stage markers, per-shot vision, a full-timeline
+    # snapshot, and per-segment narration audio all showed up as events.
     stages = {e["stage"] for e in events if e.get("type") == "stage"}
-    assert {"segmentation", "vision", "audio", "timeline", "narration"} <= stages
+    assert {
+        "segmentation",
+        "vision",
+        "audio",
+        "timeline",
+        "narration",
+        "tts",
+    } <= stages
     assert sum(1 for e in events if e.get("type") == "shot") == 2
     assert any(e.get("type") == "timeline" for e in events)
+    assert any(e.get("type") == "narration_audio" for e in events)
 
 
 async def test_run_pipeline_handles_video_without_audio(
-    tmp_path, monkeypatch, synthetic_video, fake_gemini_client
+    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
 ):
     """A source with no audio track skips VAD/transcription and still yields a
     full timeline (ad_eligible computed from shot duration alone)."""

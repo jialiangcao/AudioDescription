@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `adesc` generates audio-description (AD) narration for video: it detects shots, describes each
-shot visually, transcribes dialogue, finds speech-free gaps long enough to narrate, and asks
-Gemini to write a narration line sized to fit each gap. It also features interactive Q&A.
+shot visually, transcribes dialogue, finds speech-free gaps long enough to narrate, asks Gemini
+to write a narration line sized to fit each gap, and synthesizes that line to speech with Kokoro.
+It also features interactive Q&A.
 
 It runs as a web app: a FastAPI backend (`src/`) drives the pipeline per uploaded video and
 streams progress over a websocket; a Next.js frontend (`frontend/`) provides drag-and-drop
@@ -25,9 +26,9 @@ cd frontend && npm install && npm run dev                          # frontend @ 
 
 `--app-dir src` puts `src/` on `sys.path`, preserving the flat-import convention (below). Use a
 **single** worker process only — the `JobStore` is in-memory, so `--workers > 1` would split
-jobs across processes. Requires `ffmpeg`/`ffprobe` on PATH (audio extraction) and a
-`GEMINI_API_KEY` in `.env` (loaded via `python-dotenv`; the server boots without one and only
-fails a job when it actually calls Gemini).
+jobs across processes. Requires `ffmpeg`/`ffprobe` on PATH (audio extraction), `espeak-ng` on
+PATH (Kokoro's G2P fallback for narration TTS), and a `GEMINI_API_KEY` in `.env` (loaded via
+`python-dotenv`; the server boots without one and only fails a job when it actually calls Gemini).
 
 Tests: `uv run pytest`. Lint/format/types: `uv run ruff check .`, `uv run ruff format .`,
 `uv run pyright src`.
@@ -39,14 +40,15 @@ Tests: `uv run pytest`. Lint/format/types: `uv run ruff check .`, `uv run ruff f
 fixed pool of worker tasks. `src/jobs.py` holds the in-memory `JobStore` (job status, timeline
 snapshot, append-only event log for websocket replay, per-job subscriber fan-out, TTL sweep, and
 crash recovery from a mirrored `status.json`). `src/pipeline.py::run_pipeline()` orchestrates the
-six stages below against job-scoped paths and reports progress via an async `on_event` callback
-(stage markers, per-shot vision, the assembled timeline, per-segment narration); CPU-bound stages
-run via `asyncio.to_thread`, Gemini stages run natively async. The routes are: `POST /api/jobs`
-(upload), `WS /api/jobs/{id}/events` (live stream + replay), `GET /api/jobs/{id}` (status +
-timeline snapshot), `GET /api/jobs/{id}/frames/{filename}` (keyframe jpgs, path-traversal
-checked), `POST /api/jobs/{id}/ask` (Q&A).
+seven stages below against job-scoped paths and reports progress via an async `on_event` callback
+(stage markers, per-shot vision, the assembled timeline, per-segment narration text, per-segment
+narration audio); CPU-bound stages run via `asyncio.to_thread`, Gemini stages run natively async.
+The routes are: `POST /api/jobs` (upload), `WS /api/jobs/{id}/events` (live stream + replay),
+`GET /api/jobs/{id}` (status + timeline snapshot), `GET /api/jobs/{id}/frames/{filename}`
+(keyframe jpgs, path-traversal checked), `GET /api/jobs/{id}/narration/{filename}` (synthesized
+narration wavs, path-traversal checked), `POST /api/jobs/{id}/ask` (Q&A).
 
-The six stages, each in its own module under `src/`:
+The seven stages, each in its own module under `src/`:
 
 1. **`segmentation.py`** — `segment_video()` uses PySceneDetect (`ContentDetector`) to find shot
    (camera cut) boundaries, then grabs one midpoint keyframe per shot via OpenCV. Produces a
@@ -73,6 +75,15 @@ The six stages, each in its own module under `src/`:
    callback) calls Gemini again for each `ad_eligible` segment, capping narration length via
    `NARRATION_WORDS_PER_SEC` (2.5 wps) applied to `narratable_gap_sec`, and feeding neighboring
    dialogue as context so narration doesn't repeat what's already said.
+7. **`tts.py`** — `synthesize_narration()` is `async`: for each segment with `ad_narration` set,
+   it runs the line through Kokoro-82M (`kokoro.KPipeline`, voice `VOICE`, 24kHz) via
+   `asyncio.to_thread` and writes a WAV under the job's `narration/`. Since `narratable_gap_sec`
+   is only an estimate, a clip longer than its gap is re-synthesized once at a higher `speed`
+   (capped at `MAX_SPEED`); if it's still too long it's kept and flagged. Results are written back
+   onto the segment as `ad_narration_audio` (server path), `ad_narration_duration_sec`, and
+   `ad_narration_overflow`, and streamed via the optional `on_segment` callback. The Kokoro
+   pipeline is a single shared model, so clips are synthesized one at a time (in id order), unlike
+   the concurrent Gemini stages.
 
 Timelines are serialized as JSON via `Timeline.model_dump_json()`; `save_timeline()` /
 `load_timeline()` in `timeline.py` remain for that. `qa.py` lazily initializes its Gemini client
@@ -90,9 +101,10 @@ than introducing a package layout, unless deliberately migrating away from this.
 ### I/O layout
 
 - Per-job temp dirs under `<tempdir>/adesc-jobs/<job_id>/` hold the uploaded `source.<ext>`, the
-  extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, and a mirrored `status.json` for
-  crash recovery. They are swept after `JOB_TTL_SEC` (kept until then so Q&A can read the
-  frames). The old fixed `src/in`/`src/out` layout is gone.
+  extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, `narration/shot_XXXX.wav` synthesized
+  narration clips, and a mirrored `status.json` for crash recovery. They are swept after
+  `JOB_TTL_SEC` (kept until then so Q&A can read the frames and the frontend can play the
+  narration clips). The old fixed `src/in`/`src/out` layout is gone.
 
 Both Gemini calls (shot description and gap narration) use the same `MODEL` constant in
 `vision_analysis.py`.
