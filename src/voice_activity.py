@@ -15,20 +15,22 @@ def _load_model():
     return _MODEL
 
 
-def longest_speech_free_gap(start, end, speech_regions):
-    """Length (sec) of the longest contiguous speech-free span within ``[start, end]``.
+def longest_speech_free_span(start, end, speech_regions):
+    """``(gap_start_sec, gap_len_sec)`` of the longest speech-free span in ``[start, end]``.
 
     Narration for a shot has to be spoken during a single uninterrupted silent
     stretch, so the amount that actually fits is bounded by the *longest* such
     stretch — not by the total silence, which sums up unrelated pauses scattered
-    between dialogue and wildly over-estimates how much narration will fit.
+    between dialogue and wildly over-estimates how much narration will fit. This
+    also reports *where* that stretch begins, so callers can place the narration
+    at the moment it would actually play. ``gap_len`` is 0.0 for an empty window.
 
     ``speech_regions`` are ``(start_sec, end_sec)`` spans (as returned by
     :func:`detect_speech_regions`); they may overlap or extend outside the
     window and need not be sorted.
     """
     if end <= start:
-        return 0.0
+        return start, 0.0
 
     # Clip each speech region to the window, drop non-overlapping ones, sort.
     clipped = sorted(
@@ -37,14 +39,24 @@ def longest_speech_free_gap(start, end, speech_regions):
         if min(end, e) > max(start, s)
     )
 
-    longest = 0.0
+    best_start, best_len = start, 0.0
     cursor = start
     for s, e in clipped:
-        if s > cursor:
-            longest = max(longest, s - cursor)
+        if s - cursor > best_len:
+            best_start, best_len = cursor, s - cursor
         cursor = max(cursor, e)
-    longest = max(longest, end - cursor)
-    return longest
+    if end - cursor > best_len:
+        best_start, best_len = cursor, end - cursor
+    return best_start, best_len
+
+
+def longest_speech_free_gap(start, end, speech_regions):
+    """Length (sec) of the longest contiguous speech-free span within ``[start, end]``.
+
+    Thin wrapper over :func:`longest_speech_free_span` for callers that only need
+    the duration, not where the gap falls.
+    """
+    return longest_speech_free_span(start, end, speech_regions)[1]
 
 
 def detect_speech_regions(audio_path, threshold=0.5, sample_rate=16000):

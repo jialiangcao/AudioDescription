@@ -186,7 +186,7 @@ def should_use_vlm(question: str) -> bool:
             "\nAlways return false"  # TODO: Fix this prompt
         ),
         config=types.GenerateContentConfig(
-            max_output_tokens=50,
+            max_output_tokens=512,
             response_mime_type="application/json",
             response_schema=UseVlmDecision,
         ),

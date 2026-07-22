@@ -81,7 +81,8 @@ async def test_synthesize_narration_happy_path_writes_wav_without_retry(
 
     out_seg = result.segments[0]
     assert out_seg.ad_narration_audio == str(tmp_path / "shot_0000.wav")
-    assert out_seg.ad_narration_duration_sec == 1.0
+    # 1.0s of speech + 0.1s leading pad (10% of the 1.0s shot) = 1.1s total.
+    assert out_seg.ad_narration_duration_sec == 1.1
     assert out_seg.ad_narration_overflow is False
     assert (tmp_path / "shot_0000.wav").exists()
 
@@ -89,8 +90,9 @@ async def test_synthesize_narration_happy_path_writes_wav_without_retry(
 async def test_synthesize_narration_retries_at_higher_speed_when_overflowing(
     tmp_path, monkeypatch
 ):
-    # First call: 3.0s of audio for a 2.0s gap -> overflow, expect a retry at
-    # speed = min(MAX_SPEED, 3.0/2.0) = 1.3. Retry call: 1.5s, which fits.
+    # Shot is 1.0s, so pad = 0.1s and the speech budget is gap-pad = 1.9s. First
+    # call: 3.0s of audio over that budget -> retry at speed = min(MAX_SPEED,
+    # 3.0/1.9) = 1.3. Retry call: 1.5s of speech, which fits.
     fake = _install_fake_pipeline(
         monkeypatch, [3 * tts.SAMPLE_RATE, int(1.5 * tts.SAMPLE_RATE)]
     )
@@ -107,15 +109,17 @@ async def test_synthesize_narration_retries_at_higher_speed_when_overflowing(
     assert fake.calls[1] == ("a long line", tts.VOICE, tts.MAX_SPEED)
 
     out_seg = result.segments[0]
-    assert out_seg.ad_narration_duration_sec == 1.5
+    # 1.5s of sped-up speech + 0.1s pad = 1.6s, comfortably under the 2.0s gap.
+    assert out_seg.ad_narration_duration_sec == 1.6
     assert out_seg.ad_narration_overflow is False
 
 
 async def test_synthesize_narration_flags_persistent_overflow_after_one_retry(
     tmp_path, monkeypatch
 ):
-    # Both calls overflow a 2.0s gap even at MAX_SPEED -> only one retry attempt,
-    # and the result is flagged rather than retried again.
+    # Both calls overflow even at MAX_SPEED -> only one retry attempt, and the
+    # padded clip (2.5s speech + 0.1s pad = 2.6s > 2.0s gap) is flagged rather
+    # than retried again.
     fake = _install_fake_pipeline(
         monkeypatch, [3 * tts.SAMPLE_RATE, int(2.5 * tts.SAMPLE_RATE)]
     )
@@ -129,8 +133,95 @@ async def test_synthesize_narration_flags_persistent_overflow_after_one_retry(
 
     assert len(fake.calls) == 2
     out_seg = result.segments[0]
-    assert out_seg.ad_narration_duration_sec == 2.5
+    assert out_seg.ad_narration_duration_sec == 2.6
     assert out_seg.ad_narration_overflow is True
+
+
+async def test_synthesize_narration_prepends_start_padding(tmp_path, monkeypatch):
+    import soundfile as sf
+
+    # Yield a constant non-zero tone so we can tell the leading pad (silence)
+    # apart from the spoken part.
+    class TonePipeline:
+        calls: list = []
+
+        def __call__(self, text, voice, speed):
+            self.calls.append((text, voice, speed))
+            yield "gs", "ps", np.ones(tts.SAMPLE_RATE, dtype=np.float32)  # 1.0s tone
+
+    monkeypatch.setattr(tts, "_load_pipeline", lambda: TonePipeline())
+
+    # A 10s shot -> pad = 10% = 1.0s of leading silence before the 1.0s tone.
+    seg = _segment(0, ad_eligible=True, ad_narration="hi", narratable_gap_sec=8.0)
+    seg.start, seg.end = 0.0, 10.0
+    tl = Timeline(video_id="v", duration_sec=10.0, segments=[seg])
+
+    result = await tts.synthesize_narration(tl, out_dir=str(tmp_path))
+
+    assert result.segments[0].ad_narration_duration_sec == 2.0  # 1.0s pad + 1.0s tone
+    audio, sr = sf.read(str(tmp_path / "shot_0000.wav"), dtype="float32")
+    assert sr == tts.SAMPLE_RATE
+    assert len(audio) == 2 * tts.SAMPLE_RATE
+    # First second is silent padding, the rest is the tone (WAV round-trips
+    # through 16-bit, so the tone reads back as ~0.99997, not exactly 1.0).
+    assert np.allclose(audio[: tts.SAMPLE_RATE], 0.0)
+    assert np.all(audio[tts.SAMPLE_RATE :] > 0.9)
+
+
+async def test_synthesize_narration_retry_optimizes_on_overflow(tmp_path, monkeypatch):
+    # 1.0s shot -> pad 0.1s, speech budget 1.9s. First synth 3.0s overflows even
+    # after the speed-up retry (2.5s -> 2.6s padded > 2.0s gap), so the retry
+    # optimization fires; the shortened line synthesizes to 1.0s (1.1s padded).
+    fake = _install_fake_pipeline(
+        monkeypatch,
+        [3 * tts.SAMPLE_RATE, int(2.5 * tts.SAMPLE_RATE), tts.SAMPLE_RATE],
+    )
+
+    seg = _segment(
+        0, ad_eligible=True, ad_narration="a very long line", narratable_gap_sec=2.0
+    )
+    tl = Timeline(video_id="v", duration_sec=2.0, segments=[seg])
+
+    seen = []
+
+    async def retry_optimize(segment, tts_duration, gap_sec):
+        seen.append((segment.id, tts_duration, gap_sec))
+        return "short line"
+
+    result = await tts.synthesize_narration(
+        tl, out_dir=str(tmp_path), retry_optimize=retry_optimize
+    )
+
+    # Retry fired once with the measured (padded) duration and the gap.
+    assert seen == [(0, 2.6, 2.0)]
+    # Third synth call re-spoke the shortened line, which now fits.
+    assert len(fake.calls) == 3
+    assert fake.calls[2][0] == "short line"
+
+    out_seg = result.segments[0]
+    assert out_seg.ad_narration == "short line"
+    assert out_seg.ad_narration_duration_sec == 1.1
+    assert out_seg.ad_narration_overflow is False
+
+
+async def test_synthesize_narration_skips_retry_when_clip_fits(tmp_path, monkeypatch):
+    _install_fake_pipeline(monkeypatch, [tts.SAMPLE_RATE])
+
+    seg = _segment(0, ad_eligible=True, ad_narration="hello", narratable_gap_sec=2.0)
+    tl = Timeline(video_id="v", duration_sec=2.0, segments=[seg])
+
+    called = False
+
+    async def retry_optimize(segment, tts_duration, gap_sec):
+        nonlocal called
+        called = True
+        return "unused"
+
+    await tts.synthesize_narration(
+        tl, out_dir=str(tmp_path), retry_optimize=retry_optimize
+    )
+
+    assert called is False  # clip fit, so no retry optimization
 
 
 async def test_synthesize_narration_streams_finished_segments(tmp_path, monkeypatch):

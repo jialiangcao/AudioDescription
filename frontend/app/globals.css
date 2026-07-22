@@ -179,6 +179,17 @@ h1 {
   border-radius: 0 6px 6px 0;
 }
 
+.ad-track {
+  margin-top: 36px;
+  border-top: 1px solid var(--border);
+  padding-top: 24px;
+}
+
+.ad-track audio {
+  width: 100%;
+  margin-top: 8px;
+}
+
 .qa {
   margin-top: 36px;
   border-top: 1px solid var(--border);

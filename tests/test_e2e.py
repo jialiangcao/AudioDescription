@@ -51,7 +51,9 @@ async def test_run_pipeline_end_to_end(
             # Narration was synthesized to a real WAV that fits the gap.
             assert segment.ad_narration_audio is not None
             assert (job_dir / "narration" / "shot_0000.wav").exists()
-            assert segment.ad_narration_duration_sec == 1.0
+            # 1.0s of synthesized speech + a 0.22s leading pad (10% of the 2.2s
+            # shot) = 1.22s, still within the gap.
+            assert segment.ad_narration_duration_sec == 1.22
             assert segment.ad_narration_overflow is False
         else:
             assert segment.ad_narration is None
@@ -73,6 +75,14 @@ async def test_run_pipeline_end_to_end(
     assert sum(1 for e in events if e.get("type") == "shot") == 2
     assert any(e.get("type") == "timeline" for e in events)
     assert any(e.get("type") == "narration_audio" for e in events)
+
+    # The combined AD-only track was assembled, streamed, and recorded on the
+    # timeline, spanning the whole video.
+    assert timeline.ad_track_audio is not None
+    assert (job_dir / "narration" / "ad_track.wav").exists()
+    ad_track_events = [e for e in events if e.get("type") == "ad_track"]
+    assert len(ad_track_events) == 1
+    assert ad_track_events[0]["audio"] == "ad_track.wav"
 
 
 async def test_run_pipeline_handles_video_without_audio(

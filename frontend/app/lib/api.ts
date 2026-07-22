@@ -42,6 +42,7 @@ export interface Segment {
   audio: AudioAnalysis | null;
   ad_eligible: boolean | null;
   narratable_gap_sec: number | null;
+  narration_start_sec: number | null;
   ad_narration: string | null;
   // Server-side path to the synthesized narration WAV; pass through narrationUrl().
   ad_narration_audio: string | null;
@@ -53,6 +54,9 @@ export interface Timeline {
   video_id: string;
   duration_sec: number;
   segments: Segment[];
+  // Combined AD-only track: every narration clip placed at its play time.
+  ad_track_audio: string | null;
+  ad_track_duration_sec: number | null;
 }
 
 export type JobStatus =
@@ -74,6 +78,7 @@ export type PipelineEvent =
       duration_sec: number | null;
       overflow: boolean | null;
     }
+  | { type: "ad_track"; audio: string; duration_sec: number | null }
   | { type: "status"; status: JobStatus; error: string | null };
 
 export async function uploadVideo(file: File): Promise<string> {

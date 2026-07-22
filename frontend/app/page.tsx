@@ -37,6 +37,7 @@ export default function Home() {
   const [segments, setSegments] = useState<Record<number, Partial<Segment>>>(
     {},
   );
+  const [adTrack, setAdTrack] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
 
@@ -50,6 +51,7 @@ export default function Home() {
     setAnswer(null);
     setSegments({});
     setStages({});
+    setAdTrack(null);
     setStatus(null);
     setVideoUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
@@ -112,6 +114,9 @@ export default function Home() {
               ad_narration_overflow: event.overflow,
             },
           }));
+          break;
+        case "ad_track":
+          setAdTrack(event.audio);
           break;
         case "status":
           setStatus(event.status);
@@ -252,6 +257,17 @@ export default function Home() {
           </div>
         </div>
       ))}
+
+      {adTrack && (
+        <div className="ad-track">
+          <h2>Full audio-description track</h2>
+          <p className="subtitle">
+            Every narration line stitched together and spaced to play in sync
+            with the video.
+          </p>
+          <audio controls src={narrationUrl(jobId!, adTrack)} />
+        </div>
+      )}
 
       {jobId && (
         <div className="qa">

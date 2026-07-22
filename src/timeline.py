@@ -3,7 +3,7 @@ import logging
 import cv2
 from pydantic import BaseModel, Field
 
-from voice_activity import longest_speech_free_gap
+from voice_activity import longest_speech_free_span
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,10 @@ class Segment(BaseModel):
     audio: AudioAnalysis | None = None
     ad_eligible: bool | None = None
     narratable_gap_sec: float | None = None
+    # Absolute time (sec) where the narratable gap begins — i.e. when this shot's
+    # narration would start playing alongside the video. Used to place clips in
+    # the combined AD track.
+    narration_start_sec: float | None = None
     # Populated by vision_analysis.fill_narration_gaps for ad_eligible segments.
     ad_narration: str | None = None
     # Populated by tts.synthesize_narration for segments with ad_narration set.
@@ -52,6 +56,11 @@ class Timeline(BaseModel):
     video_id: str
     duration_sec: float
     segments: list[Segment]
+    # Populated by ad_track.build_ad_track: a single WAV with every narration clip
+    # placed at the moment it would play alongside the video. ad_track_audio is
+    # the server-side path; pass its basename through the narration endpoint.
+    ad_track_audio: str | None = None
+    ad_track_duration_sec: float | None = None
 
 
 def _overlap_sec(a_start, a_end, b_start, b_end):
@@ -106,9 +115,8 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
         # Narration must fit one uninterrupted silent stretch, so size the gap to
         # the longest contiguous speech-free span — not the total silence, which
         # over-estimates the fit and makes narration overrun (and get cut off).
-        narratable_gap_sec = round(
-            longest_speech_free_gap(start, end, speech_regions), 2
-        )
+        gap_start, gap_len = longest_speech_free_span(start, end, speech_regions)
+        narratable_gap_sec = round(gap_len, 2)
 
         segments.append(
             Segment(
@@ -121,6 +129,7 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
                 audio=audio,
                 ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
                 narratable_gap_sec=narratable_gap_sec,
+                narration_start_sec=round(gap_start, 2),
             )
         )
 

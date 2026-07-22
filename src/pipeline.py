@@ -15,12 +15,17 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from ad_track import build_ad_track
 from audio_extract import NoAudioStreamError, extract_audio
 from segmentation import segment_video
 from timeline import Timeline, build_timeline
 from transcription import transcribe
 from tts import synthesize_narration
-from vision_analysis import analyze_shots, fill_narration_gaps
+from vision_analysis import (
+    analyze_shots,
+    fill_narration_gaps,
+    retry_optimize_narration,
+)
 from voice_activity import detect_speech_regions
 
 logger = logging.getLogger(__name__)
@@ -210,10 +215,39 @@ async def run_pipeline(
             }
         )
 
+    async def _retry_optimize(segment, tts_duration, gap_sec) -> str:
+        return await retry_optimize_narration(
+            client, segment.ad_narration, tts_duration, gap_sec
+        )
+
+    # Only wire the TTS-verified retry pass when we actually have a Gemini client.
+    retry_optimize: Callable[..., Awaitable[str]] | None = (
+        _retry_optimize if client is not None else None
+    )
+
     timeline = await synthesize_narration(
-        timeline, out_dir=str(narration_dir), on_segment=_on_narration_audio
+        timeline,
+        out_dir=str(narration_dir),
+        on_segment=_on_narration_audio,
+        retry_optimize=retry_optimize,
     )
     logger.info("stage 7/7 tts done in %.1fs", time.monotonic() - t0)
+
+    # Assemble every narration clip into one video-length "AD-only" track, each
+    # clip placed where it would play alongside the source.
+    result = await asyncio.to_thread(build_ad_track, timeline, str(narration_dir))
+    if result is not None:
+        ad_track_path, ad_track_duration = result
+        timeline.ad_track_audio = ad_track_path
+        timeline.ad_track_duration_sec = ad_track_duration
+        await on_event(
+            {
+                "type": "ad_track",
+                "audio": Path(ad_track_path).name,
+                "duration_sec": ad_track_duration,
+            }
+        )
+
     logger.info("pipeline complete: %s", video_path)
 
     return timeline

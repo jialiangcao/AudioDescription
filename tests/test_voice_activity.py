@@ -1,6 +1,6 @@
 import pytest
 
-from voice_activity import longest_speech_free_gap
+from voice_activity import longest_speech_free_gap, longest_speech_free_span
 
 
 def test_no_speech_returns_full_window():
@@ -40,3 +40,25 @@ def test_empty_window_returns_zero():
 
 def test_speech_filling_window_returns_zero():
     assert longest_speech_free_gap(0.0, 3.0, [(0.0, 3.0)]) == pytest.approx(0.0)
+
+
+def test_span_reports_gap_start_and_length():
+    # Longest silent stretch is 8.0-10.0; it begins right after the last burst.
+    regions = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0), (7.0, 8.0)]
+    start, length = longest_speech_free_span(0.0, 10.0, regions)
+    assert start == pytest.approx(8.0)
+    assert length == pytest.approx(2.0)
+
+
+def test_span_gap_in_the_middle():
+    # Silence runs 2.0-7.0 (between the two bursts), longer than the edges.
+    start, length = longest_speech_free_span(0.0, 8.0, [(1.0, 2.0), (7.0, 7.5)])
+    assert start == pytest.approx(2.0)
+    assert length == pytest.approx(5.0)
+
+
+def test_span_no_speech_starts_at_window_start():
+    assert longest_speech_free_span(3.0, 9.0, []) == (
+        pytest.approx(3.0),
+        pytest.approx(6.0),
+    )
