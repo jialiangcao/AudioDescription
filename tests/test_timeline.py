@@ -107,6 +107,26 @@ def test_build_timeline_computes_duration_and_ad_eligibility(monkeypatch):
     assert second.ad_eligible is False
 
 
+def test_build_timeline_sizes_gap_to_longest_silence_not_total(monkeypatch):
+    monkeypatch.setattr(
+        timeline_module.cv2,
+        "VideoCapture",
+        lambda path: _FakeCapture(fps=10.0, frame_count=50),
+    )
+
+    # A 5s shot chopped by three 0.6s speech bursts: total silence is 3.2s (which
+    # would clear the 2.0s threshold under the old sum-of-silence calc), but no
+    # single contiguous silent stretch exceeds 1.0s -> not narratable.
+    shots = [_shot(0, 0.0, 5.0)]
+    speech_regions = [(1.0, 1.6), (2.4, 3.0), (3.8, 4.4)]
+
+    tl = build_timeline("video.mp4", shots, speech_regions, transcript_segments=[])
+
+    seg = tl.segments[0]
+    assert seg.narratable_gap_sec == pytest.approx(1.0)
+    assert seg.ad_eligible is False
+
+
 def test_save_and_load_timeline_roundtrip(tmp_path):
     tl = Timeline(
         video_id="video.mp4",

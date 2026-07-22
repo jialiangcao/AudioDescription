@@ -3,6 +3,8 @@ import logging
 import cv2
 from pydantic import BaseModel, Field
 
+from voice_activity import longest_speech_free_gap
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,7 +103,12 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
     for shot in shots:
         start, end = shot["start"], shot["end"]
         audio = _build_audio_analysis(start, end, speech_regions, transcript_segments)
-        narratable_gap_sec = round(audio.silence_ratio * (end - start), 2)
+        # Narration must fit one uninterrupted silent stretch, so size the gap to
+        # the longest contiguous speech-free span — not the total silence, which
+        # over-estimates the fit and makes narration overrun (and get cut off).
+        narratable_gap_sec = round(
+            longest_speech_free_gap(start, end, speech_regions), 2
+        )
 
         segments.append(
             Segment(

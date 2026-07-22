@@ -13,7 +13,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.5-flash"
 
 # How many Gemini calls to keep in flight at once within a single job's
 # shot-analysis / narration loop.
@@ -42,6 +42,9 @@ async def analyze_keyframe(client, keyframe_path):
             max_output_tokens=1024,
             response_mime_type="application/json",
             response_schema=ShotAnalysis,
+            # Reasoning tokens count against max_output_tokens and can starve the
+            # structured JSON output; this is a direct extraction task, so skip it.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
 
@@ -118,7 +121,14 @@ async def generate_narration(client, segment, max_words, neighbor_transcript=Non
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
             prompt,
         ],
-        config=types.GenerateContentConfig(max_output_tokens=256),
+        config=types.GenerateContentConfig(
+            max_output_tokens=2048,
+            # gemini-2.5-flash "thinks" by default, and those reasoning tokens
+            # count against max_output_tokens — leaving little to no budget for
+            # the actual narration, which came out truncated after a few words.
+            # Narration is a short, single-line task that needs no reasoning.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
     )
 
     if response.text is None:
