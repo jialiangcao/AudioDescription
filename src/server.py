@@ -39,6 +39,7 @@ from jobs import (
     JobStore,
 )
 from log_config import configure_logging
+from mux import DESCRIBED_FILENAME
 from pipeline import run_pipeline
 from timeline import Timeline
 
@@ -264,6 +265,21 @@ async def get_narration(job_id: str, filename: str) -> FileResponse:
     if not target.is_relative_to(narration_dir) or not target.is_file():
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(target, media_type="audio/wav")
+
+
+@app.get("/api/jobs/{job_id}/described")
+async def get_described_video(job_id: str) -> FileResponse:
+    """The muxed video: original picture + soundtrack with narration mixed in.
+
+    A single well-known artifact per job, so there's no filename parameter (and
+    hence no traversal surface) — unlike the frames/narration endpoints.
+    """
+    job = _require_job(app, job_id)
+    target = job.dir / DESCRIBED_FILENAME
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="described video not available")
+    # FileResponse serves Range requests, which the browser needs in order to seek.
+    return FileResponse(target, media_type="video/mp4")
 
 
 @app.post("/api/jobs/{job_id}/ask")

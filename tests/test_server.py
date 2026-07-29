@@ -68,6 +68,10 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
             "overflow": False,
         }
     )
+
+    (job_dir / "described.mp4").write_bytes(b"fake-mp4")
+    tl.described_video = str(job_dir / "described.mp4")
+    await on_event({"type": "described_video", "video": "described.mp4"})
     return tl
 
 
@@ -209,3 +213,25 @@ def test_narration_rejects_traversal_and_non_wav(client, bad_name):
 
     resp = client.get(f"/api/jobs/{job_id}/narration/{bad_name}")
     assert resp.status_code == 404
+
+
+def test_described_serves_the_muxed_video(client):
+    job_id = _upload(client).json()["job_id"]
+    _wait_status(client, job_id, "done")
+
+    resp = client.get(f"/api/jobs/{job_id}/described")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.content == b"fake-mp4"
+
+    # Range requests must work, or the browser can't seek within the video.
+    ranged = client.get(f"/api/jobs/{job_id}/described", headers={"Range": "bytes=0-3"})
+    assert ranged.status_code == 206
+    assert ranged.content == b"fake"
+
+
+def test_described_404_when_not_muxed(client):
+    # a job that exists but never produced a described video
+    store: JobStore = server.app.state.store
+    job = store.create()
+    assert client.get(f"/api/jobs/{job.id}/described").status_code == 404

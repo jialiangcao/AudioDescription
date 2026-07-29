@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   askQuestion,
+  describedVideoUrl,
   frameUrl,
   narrationUrl,
   uploadVideo,
@@ -19,6 +20,7 @@ const STAGE_ORDER = [
   "timeline",
   "narration",
   "tts",
+  "mux",
 ];
 const STAGE_LABELS: Record<string, string> = {
   segmentation: "Shots",
@@ -27,6 +29,7 @@ const STAGE_LABELS: Record<string, string> = {
   timeline: "Timeline",
   narration: "Narration",
   tts: "Voice",
+  mux: "Mix",
 };
 
 export default function Home() {
@@ -37,7 +40,7 @@ export default function Home() {
   const [segments, setSegments] = useState<Record<number, Partial<Segment>>>(
     {},
   );
-  const [adTrack, setAdTrack] = useState<string | null>(null);
+  const [described, setDescribed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
 
@@ -51,7 +54,7 @@ export default function Home() {
     setAnswer(null);
     setSegments({});
     setStages({});
-    setAdTrack(null);
+    setDescribed(false);
     setStatus(null);
     setVideoUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
@@ -115,8 +118,8 @@ export default function Home() {
             },
           }));
           break;
-        case "ad_track":
-          setAdTrack(event.audio);
+        case "described_video":
+          setDescribed(true);
           break;
         case "status":
           setStatus(event.status);
@@ -194,7 +197,19 @@ export default function Home() {
 
       {videoUrl && (
         <div className="video-preview">
-          <video src={videoUrl} controls />
+          {/* Once the mux stage finishes, play the described cut in place of the
+              local file — same picture, narration mixed into the soundtrack. The
+              key forces a reload when the source swaps. */}
+          <video
+            key={described ? "described" : "original"}
+            src={described && jobId ? describedVideoUrl(jobId) : videoUrl}
+            controls
+          />
+          <p className="video-caption">
+            {described
+              ? "🎙 With audio description — the original sound ducks under each narration line."
+              : "Original audio. The described version replaces this when processing finishes."}
+          </p>
         </div>
       )}
 
@@ -257,17 +272,6 @@ export default function Home() {
           </div>
         </div>
       ))}
-
-      {adTrack && (
-        <div className="ad-track">
-          <h2>Full audio-description track</h2>
-          <p className="subtitle">
-            Every narration line stitched together and spaced to play in sync
-            with the video.
-          </p>
-          <audio controls src={narrationUrl(jobId!, adTrack)} />
-        </div>
-      )}
 
       {jobId && (
         <div className="qa">

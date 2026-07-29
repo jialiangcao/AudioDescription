@@ -20,6 +20,11 @@ export function narrationUrl(jobId: string, audioPath: string): string {
   return `${API_BASE}/api/jobs/${jobId}/narration/${basename(audioPath)}`;
 }
 
+/** The muxed video: original picture + soundtrack with narration mixed in. */
+export function describedVideoUrl(jobId: string): string {
+  return `${API_BASE}/api/jobs/${jobId}/described`;
+}
+
 export interface VisualAnalysis {
   description: string;
   entities: string[];
@@ -57,6 +62,9 @@ export interface Timeline {
   // Combined AD-only track: every narration clip placed at its play time.
   ad_track_audio: string | null;
   ad_track_duration_sec: number | null;
+  // Server-side path to the video with the AD track mixed in; fetch it from
+  // describedVideoUrl() rather than using this path directly.
+  described_video: string | null;
 }
 
 export type JobStatus =
@@ -79,6 +87,7 @@ export type PipelineEvent =
       overflow: boolean | null;
     }
   | { type: "ad_track"; audio: string; duration_sec: number | null }
+  | { type: "described_video"; video: string }
   | { type: "status"; status: JobStatus; error: string | null };
 
 export async function uploadVideo(file: File): Promise<string> {

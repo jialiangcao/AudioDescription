@@ -69,6 +69,12 @@ h1 {
   background: #000;
 }
 
+.video-caption {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 .stages {
   display: flex;
   flex-wrap: wrap;
@@ -177,17 +183,6 @@ h1 {
   border-left: 3px solid var(--accent);
   background: var(--panel-2);
   border-radius: 0 6px 6px 0;
-}
-
-.ad-track {
-  margin-top: 36px;
-  border-top: 1px solid var(--border);
-  padding-top: 24px;
-}
-
-.ad-track audio {
-  width: 100%;
-  margin-top: 8px;
 }
 
 .qa {

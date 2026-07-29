@@ -71,6 +71,7 @@ async def test_run_pipeline_end_to_end(
         "timeline",
         "narration",
         "tts",
+        "mux",
     } <= stages
     assert sum(1 for e in events if e.get("type") == "shot") == 2
     assert any(e.get("type") == "timeline" for e in events)
@@ -83,6 +84,44 @@ async def test_run_pipeline_end_to_end(
     ad_track_events = [e for e in events if e.get("type") == "ad_track"]
     assert len(ad_track_events) == 1
     assert ad_track_events[0]["audio"] == "ad_track.wav"
+
+    # …and muxed into a playable video carrying both the original sound and the
+    # narration, which is what the frontend serves up at the end.
+    assert timeline.described_video == str(job_dir / "described.mp4")
+    assert (job_dir / "described.mp4").exists()
+    described_events = [e for e in events if e.get("type") == "described_video"]
+    assert len(described_events) == 1
+    assert described_events[0]["video"] == "described.mp4"
+
+
+async def test_run_pipeline_skips_mux_without_narration(
+    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
+):
+    """No narration clips means nothing to mix: the mux stage closes out without
+    a described video rather than handing ffmpeg an empty track."""
+    monkeypatch.setattr(pipeline, "detect_speech_regions", lambda audio_path: [])
+    monkeypatch.setattr(pipeline, "transcribe", lambda audio_path, regions: [])
+    monkeypatch.setattr(pipeline, "build_ad_track", lambda timeline, out_dir: None)
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    timeline = await run_pipeline(
+        synthetic_video, job_dir, on_event, client=fake_gemini_client
+    )
+
+    assert timeline.described_video is None
+    assert not (job_dir / "described.mp4").exists()
+    assert not any(e.get("type") == "described_video" for e in events)
+    mux_done = [
+        e for e in events if e.get("stage") == "mux" and e.get("status") == "done"
+    ]
+    assert mux_done and mux_done[0]["described"] is False
 
 
 async def test_run_pipeline_handles_video_without_audio(

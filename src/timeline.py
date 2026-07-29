@@ -61,6 +61,10 @@ class Timeline(BaseModel):
     # the server-side path; pass its basename through the narration endpoint.
     ad_track_audio: str | None = None
     ad_track_duration_sec: float | None = None
+    # Populated by mux.mux_described_video: the source video with the AD track
+    # mixed into its soundtrack, i.e. the file to watch. Server-side path; the
+    # frontend fetches it from the job's described-video endpoint.
+    described_video: str | None = None
 
 
 def _overlap_sec(a_start, a_end, b_start, b_end):
