@@ -95,10 +95,14 @@ h1 {
   color: var(--good);
 }
 
-.segment {
-  display: grid;
-  grid-template-columns: 160px 1fr;
-  gap: 16px;
+.frame-count {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 14px;
+}
+
+/* One shot: a header, then every frame sampled inside it. */
+.shot {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -106,17 +110,50 @@ h1 {
   margin-bottom: 14px;
 }
 
-.segment img {
-  width: 160px;
-  height: 90px;
+.shot-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.shot-title {
+  font-weight: 600;
+}
+
+.shot-range {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* One extracted frame: image + timestamp on the left, its own analysis right. */
+.frame {
+  display: grid;
+  grid-template-columns: 176px 1fr;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.frame:last-of-type {
+  border-bottom: none;
+}
+
+.frame-thumb img {
+  width: 176px;
+  height: 99px;
   object-fit: cover;
   border-radius: 6px;
   background: var(--panel-2);
+  display: block;
 }
 
-.segment .thumb-placeholder {
-  width: 160px;
-  height: 90px;
+.frame-thumb .thumb-placeholder {
+  width: 176px;
+  height: 99px;
   border-radius: 6px;
   background: var(--panel-2);
   display: flex;
@@ -126,20 +163,83 @@ h1 {
   font-size: 0.75rem;
 }
 
-.seg-time {
-  color: var(--muted);
+.frame-time {
+  margin-top: 6px;
+  color: var(--accent);
   font-size: 0.8rem;
-  margin-bottom: 6px;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.seg-desc {
-  margin: 0 0 8px;
+.frame-desc {
+  margin: 0 0 10px;
+  line-height: 1.45;
+}
+
+.frame-pending {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.chip-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 2px;
+}
+
+.chip {
+  font-size: 0.76rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.chip.action {
+  border-color: var(--accent-dim);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.frame-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+@media (max-width: 640px) {
+  .frame {
+    grid-template-columns: 1fr;
+  }
+
+  .frame-thumb img,
+  .frame-thumb .thumb-placeholder {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 16 / 9;
+  }
 }
 
 .seg-dialogue {
   color: var(--muted);
   font-style: italic;
-  margin: 0 0 8px;
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 .badge {

@@ -7,6 +7,7 @@ import {
   narrationUrl,
   uploadVideo,
   wsBase,
+  type Frame,
   type JobStatus,
   type PipelineEvent,
   type Segment,
@@ -22,12 +23,46 @@ const STAGE_ORDER = [
 ];
 const STAGE_LABELS: Record<string, string> = {
   segmentation: "Shots",
-  vision: "Vision",
+  vision: "Frames",
   audio: "Audio",
   timeline: "Timeline",
   narration: "Narration",
   tts: "Voice",
 };
+
+/** Absolute video timestamp as m:ss.s. */
+function fmtTime(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return `${m}:${s.toFixed(1).padStart(4, "0")}`;
+}
+
+/**
+ * Merge incoming frames into a shot's existing frame list by `index`.
+ *
+ * Frame analyses arrive out of order and after the shot skeleton, so neither
+ * side can be treated as authoritative — each frame is merged field-by-field
+ * and the result is re-sorted into temporal order.
+ */
+function mergeFrames(
+  existing: Frame[] | undefined,
+  incoming: Partial<Frame>[],
+): Frame[] {
+  const byIndex = new Map<number, Partial<Frame>>();
+  for (const frame of existing ?? []) byIndex.set(frame.index, frame);
+  for (const frame of incoming) {
+    if (frame.index == null) continue;
+    byIndex.set(frame.index, { ...byIndex.get(frame.index), ...frame });
+  }
+  return [...byIndex.values()]
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((frame) => ({
+      index: frame.index ?? 0,
+      time: frame.time ?? 0,
+      path: frame.path ?? "",
+      visual: frame.visual ?? null,
+    }));
+}
 
 export default function Home() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -80,17 +115,49 @@ export default function Home() {
             [event.stage]: event.status === "done" ? "done" : "active",
           }));
           break;
-        case "shot":
+        case "shots":
+          // Skeleton: every extracted frame with its timestamp, before any of
+          // them has been described.
+          setSegments((prev) => {
+            const next = { ...prev };
+            for (const shot of event.shots) {
+              next[shot.id] = {
+                ...next[shot.id],
+                id: shot.id,
+                start: shot.start,
+                end: shot.end,
+                frames: mergeFrames(next[shot.id]?.frames, shot.frames),
+              };
+            }
+            return next;
+          });
+          break;
+        case "frame":
           setSegments((prev) => ({
             ...prev,
-            [event.shot.id]: { ...prev[event.shot.id], ...event.shot },
+            [event.shot_id]: {
+              ...prev[event.shot_id],
+              id: event.shot_id,
+              frames: mergeFrames(prev[event.shot_id]?.frames, [
+                {
+                  index: event.index,
+                  time: event.time,
+                  path: event.path,
+                  visual: event.visual,
+                },
+              ]),
+            },
           }));
           break;
         case "timeline":
           setSegments((prev) => {
             const next = { ...prev };
             for (const seg of event.timeline.segments) {
-              next[seg.id] = { ...next[seg.id], ...seg };
+              next[seg.id] = {
+                ...next[seg.id],
+                ...seg,
+                frames: mergeFrames(next[seg.id]?.frames, seg.frames),
+              };
             }
             return next;
           });
@@ -155,6 +222,8 @@ export default function Home() {
   const orderedSegments = Object.values(segments).sort(
     (a, b) => (a.id ?? 0) - (b.id ?? 0),
   );
+  const allFrames = orderedSegments.flatMap((seg) => seg.frames ?? []);
+  const describedCount = allFrames.filter((f) => f.visual).length;
   const done = status === "done";
 
   return (
@@ -209,63 +278,121 @@ export default function Home() {
         </div>
       )}
 
+      {allFrames.length > 0 && (
+        <p className="frame-count">
+          {describedCount} / {allFrames.length} frames described across{" "}
+          {orderedSegments.length} shot{orderedSegments.length === 1 ? "" : "s"}
+        </p>
+      )}
+
       {orderedSegments.map((seg) => (
-        <div className="segment" key={seg.id}>
-          {seg.keyframe ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={frameUrl(jobId!, seg.keyframe)}
-              alt={`shot ${seg.id}`}
-            />
-          ) : (
-            <div className="thumb-placeholder">analyzing…</div>
-          )}
-          <div>
-            <div className="seg-time">
-              Shot {seg.id}
-              {seg.start != null && seg.end != null
-                ? ` · ${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s`
-                : ""}
-              {seg.ad_eligible ? (
-                <span className="badge ad" style={{ marginLeft: 8 }}>
-                  AD gap {seg.narratable_gap_sec?.toFixed(1)}s
+        <div className="shot" key={seg.id}>
+          <div className="shot-head">
+            <span className="shot-title">Shot {seg.id}</span>
+            {seg.start != null && seg.end != null ? (
+              <span className="shot-range">
+                {fmtTime(seg.start)}–{fmtTime(seg.end)}
+              </span>
+            ) : null}
+            <span className="shot-range">
+              {seg.frames?.length ?? 0} frame
+              {(seg.frames?.length ?? 0) === 1 ? "" : "s"}
+            </span>
+            {seg.ad_eligible ? (
+              <span className="badge ad">
+                AD gap {seg.narratable_gap_sec?.toFixed(1)}s
+              </span>
+            ) : null}
+          </div>
+
+          {(seg.frames ?? []).map((frame) => (
+            <div className="frame" key={frame.index}>
+              <div className="frame-thumb">
+                {jobId && frame.path ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={frameUrl(jobId, frame.path)}
+                    alt={`shot ${seg.id} frame at ${frame.time}s`}
+                  />
+                ) : (
+                  <div className="thumb-placeholder">no frame</div>
+                )}
+                <div className="frame-time">{fmtTime(frame.time)}</div>
+              </div>
+
+              <div className="frame-analysis">
+                {frame.visual ? (
+                  <>
+                    <p className="frame-desc">{frame.visual.description}</p>
+                    {frame.visual.actions.length > 0 && (
+                      <div className="chip-row">
+                        <span className="chip-label">Actions</span>
+                        {frame.visual.actions.map((action, i) => (
+                          <span className="chip action" key={i}>
+                            {action}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {frame.visual.entities.length > 0 && (
+                      <div className="chip-row">
+                        <span className="chip-label">Entities</span>
+                        {frame.visual.entities.map((entity, i) => (
+                          <span className="chip" key={i}>
+                            {entity}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div className="frame-meta">
+                      <span>Setting: {frame.visual.setting}</span>
+                      {frame.visual.on_screen_text ? (
+                        <span>
+                          On-screen text: “{frame.visual.on_screen_text}”
+                        </span>
+                      ) : null}
+                    </div>
+                  </>
+                ) : (
+                  <p className="frame-pending">analyzing…</p>
+                )}
+              </div>
+            </div>
+          ))}
+
+          {seg.audio?.transcript ? (
+            <p className="seg-dialogue">“{seg.audio.transcript}”</p>
+          ) : null}
+          {seg.ad_narration ? (
+            <div className="narration">🎙 {seg.ad_narration}</div>
+          ) : null}
+          {seg.ad_narration_audio && jobId ? (
+            <div className="narration-audio">
+              <audio
+                controls
+                src={narrationUrl(jobId, seg.ad_narration_audio)}
+              />
+              {seg.ad_narration_overflow ? (
+                <span
+                  className="badge overflow"
+                  title="Clip runs longer than the gap"
+                >
+                  overflow
                 </span>
               ) : null}
             </div>
-            <p className="seg-desc">
-              {seg.visual?.description ?? "…"}
-            </p>
-            {seg.audio?.transcript ? (
-              <p className="seg-dialogue">“{seg.audio.transcript}”</p>
-            ) : null}
-            {seg.ad_narration ? (
-              <div className="narration">🎙 {seg.ad_narration}</div>
-            ) : null}
-            {seg.ad_narration_audio ? (
-              <div className="narration-audio">
-                <audio
-                  controls
-                  src={narrationUrl(jobId!, seg.ad_narration_audio)}
-                />
-                {seg.ad_narration_overflow ? (
-                  <span className="badge overflow" title="Clip runs longer than the gap">
-                    overflow
-                  </span>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
+          ) : null}
         </div>
       ))}
 
-      {adTrack && (
+      {adTrack && jobId && (
         <div className="ad-track">
           <h2>Full audio-description track</h2>
           <p className="subtitle">
             Every narration line stitched together and spaced to play in sync
             with the video.
           </p>
-          <audio controls src={narrationUrl(jobId!, adTrack)} />
+          <audio controls src={narrationUrl(jobId, adTrack)} />
         </div>
       )}
 
@@ -276,14 +403,19 @@ export default function Home() {
             <input
               type="text"
               placeholder={
-                done ? "e.g. What color is the woman's eyes?" : "Available once processing finishes…"
+                done
+                  ? "e.g. What color is the woman's eyes?"
+                  : "Available once processing finishes…"
               }
               value={question}
               disabled={!done || asking}
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onAsk()}
             />
-            <button onClick={onAsk} disabled={!done || asking || !question.trim()}>
+            <button
+              onClick={onAsk}
+              disabled={!done || asking || !question.trim()}
+            >
               {asking ? "Thinking…" : "Ask"}
             </button>
           </div>

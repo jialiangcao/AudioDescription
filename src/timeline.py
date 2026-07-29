@@ -8,11 +8,30 @@ from voice_activity import longest_speech_free_span
 logger = logging.getLogger(__name__)
 
 
-class VisualAnalysis(BaseModel):
+class FrameAnalysis(BaseModel):
+    """The vision model's description of one sampled frame, on its own."""
+
     description: str
     entities: list[str]
+    # Short phrases, one per distinct action visible in the frame.
+    actions: list[str] = Field(default_factory=list)
     setting: str
     on_screen_text: str | None
+
+
+class Frame(BaseModel):
+    """One sampled frame of a shot, with its own independent analysis.
+
+    ``index`` is the frame's position within its shot, ``time`` its absolute
+    timestamp in the video, and ``path`` the server-side jpg path (pass its
+    basename through the frames endpoint). ``visual`` is None until the frame's
+    Gemini call lands.
+    """
+
+    index: int
+    time: float
+    path: str
+    visual: FrameAnalysis | None = None
 
 
 class AudioAnalysis(BaseModel):
@@ -32,10 +51,11 @@ class Segment(BaseModel):
     id: int
     start: float
     end: float
-    keyframe: str
-    # Every frame sampled within the shot (segmentation.py's interval_sec), for CLIP retrieval.
-    keyframes: list[str] = Field(default_factory=list)
-    visual: VisualAnalysis
+    # Every frame sampled within the shot (segmentation.py's interval_sec), in
+    # temporal order, each carrying its own independent analysis. There is no
+    # shot-level rollup: narration is written from the whole frame sequence, and
+    # Q&A retrieves over these frames.
+    frames: list[Frame] = Field(default_factory=list)
     audio: AudioAnalysis | None = None
     ad_eligible: bool | None = None
     narratable_gap_sec: float | None = None
@@ -123,9 +143,7 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
                 id=shot["id"],
                 start=start,
                 end=end,
-                keyframe=shot["keyframe"],
-                keyframes=shot.get("keyframes", []),
-                visual=VisualAnalysis(**shot["visual"]),
+                frames=[Frame(**frame) for frame in shot.get("frames", [])],
                 audio=audio,
                 ad_eligible=narratable_gap_sec >= MIN_NARRATABLE_GAP_SEC,
                 narratable_gap_sec=narratable_gap_sec,

@@ -35,8 +35,16 @@ async def test_run_pipeline_end_to_end(
     assert (job_dir / "audio.wav").exists()
 
     for segment in timeline.segments:
-        # Gemini call was stubbed; every shot gets the same canned analysis.
-        assert segment.visual.description == "a test scene"
+        # Every sampled frame is described on its own — there is no shot-level
+        # rollup. The Gemini call was stubbed, so each gets the same canned
+        # analysis, but each frame carries its own timestamp inside the shot.
+        assert segment.frames
+        for expected_index, frame in enumerate(segment.frames):
+            assert frame.index == expected_index
+            assert segment.start <= frame.time <= segment.end
+            assert frame.visual is not None
+            assert frame.visual.description == "a test scene"
+            assert frame.visual.actions == ["an object moves"]
         # VAD was stubbed to find no speech, so each shot is fully silent.
         assert segment.audio is not None
         assert segment.audio.has_speech is False
@@ -61,8 +69,9 @@ async def test_run_pipeline_end_to_end(
 
     assert any(segment.ad_eligible for segment in timeline.segments)
 
-    # Live progress was streamed: stage markers, per-shot vision, a full-timeline
-    # snapshot, and per-segment narration audio all showed up as events.
+    # Live progress was streamed: stage markers, the shot/frame skeleton, one
+    # event per described frame, a full-timeline snapshot, and per-segment
+    # narration audio all showed up as events.
     stages = {e["stage"] for e in events if e.get("type") == "stage"}
     assert {
         "segmentation",
@@ -72,7 +81,24 @@ async def test_run_pipeline_end_to_end(
         "narration",
         "tts",
     } <= stages
-    assert sum(1 for e in events if e.get("type") == "shot") == 2
+
+    total_frames = sum(len(s.frames) for s in timeline.segments)
+    skeletons = [e for e in events if e.get("type") == "shots"]
+    assert len(skeletons) == 1
+    assert [shot["id"] for shot in skeletons[0]["shots"]] == [0, 1]
+    # The skeleton carries every frame's timestamp before any analysis lands.
+    assert sum(len(shot["frames"]) for shot in skeletons[0]["shots"]) == total_frames
+
+    frame_events = [e for e in events if e.get("type") == "frame"]
+    assert len(frame_events) == total_frames
+    assert {(e["shot_id"], e["index"]) for e in frame_events} == {
+        (seg.id, frame.index) for seg in timeline.segments for frame in seg.frames
+    }
+    # Frame events reference bare filenames, ready for the frames endpoint.
+    for event in frame_events:
+        assert "/" not in event["path"]
+        assert (job_dir / "frames" / event["path"]).exists()
+
     assert any(e.get("type") == "timeline" for e in events)
     assert any(e.get("type") == "narration_audio" for e in events)
 

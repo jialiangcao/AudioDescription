@@ -54,18 +54,51 @@ def synthetic_video(tmp_path_factory):
     return str(out_path)
 
 
+@pytest.fixture(scope="session")
+def single_shot_video(tmp_path_factory):
+    """A tiny 3s solid-color clip: no camera cuts at all.
+
+    Exercises detect_shots' no-cuts fallback, which reports the whole video as
+    one shot from PySceneDetect's `video.duration` rather than a scene list.
+    """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available on PATH")
+
+    out_path = tmp_path_factory.mktemp("media") / "single_shot.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=320x240:d=3",
+            "-c:v",
+            "libx264",
+            "-r",
+            "10",
+            str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return str(out_path)
+
+
 class FakeGeminiResponse:
     def __init__(self, text):
         self.text = text
 
 
 def _canned_response(config):
-    """Shot-analysis calls (config.response_schema set) get canned JSON matching
-    ShotAnalysis; narration calls (no schema) get a canned sentence."""
+    """Frame-analysis calls (config.response_schema set) get canned JSON matching
+    FrameAnalysis; narration calls (no schema) get a canned sentence."""
     if getattr(config, "response_schema", None) is not None:
         return FakeGeminiResponse(
             '{"description": "a test scene", "entities": ["object"], '
-            '"setting": "a test setting", "on_screen_text": null}'
+            '"actions": ["an object moves"], "setting": "a test setting", '
+            '"on_screen_text": null}'
         )
     return FakeGeminiResponse("A quiet moment unfolds on screen.")
 

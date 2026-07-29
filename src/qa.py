@@ -226,7 +226,7 @@ def _ask_vlm(question: str, frame_paths: list[str]) -> str:
 
 
 def answer_question(timeline: Timeline, question: str) -> str:
-    frame_paths = [path for seg in timeline.segments for path in seg.keyframes]
+    frame_paths = [frame.path for seg in timeline.segments for frame in seg.frames]
     logger.info(
         "answer_question: question=%r over %d total frames",
         question,

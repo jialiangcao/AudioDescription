@@ -7,7 +7,7 @@ from starlette.websockets import WebSocketDisconnect
 import qa
 import server
 from jobs import JobStore
-from timeline import AudioAnalysis, Segment, Timeline, VisualAnalysis
+from timeline import AudioAnalysis, Frame, FrameAnalysis, Segment, Timeline
 
 
 def _timeline() -> Timeline:
@@ -19,13 +19,20 @@ def _timeline() -> Timeline:
                 id=0,
                 start=0.0,
                 end=2.0,
-                keyframe="shot_0000_00.jpg",
-                visual=VisualAnalysis(
-                    description="a test scene",
-                    entities=[],
-                    setting="s",
-                    on_screen_text=None,
-                ),
+                frames=[
+                    Frame(
+                        index=0,
+                        time=0.0,
+                        path="shot_0000_00.jpg",
+                        visual=FrameAnalysis(
+                            description="a test scene",
+                            entities=[],
+                            actions=["an object moves"],
+                            setting="s",
+                            on_screen_text=None,
+                        ),
+                    )
+                ],
                 audio=AudioAnalysis(
                     has_speech=False, transcript=None, silence_ratio=1.0
                 ),
@@ -48,8 +55,31 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
     await on_event(
         {
-            "type": "shot",
-            "shot": {"id": 0, "keyframe": str(frames / "shot_0000_00.jpg")},
+            "type": "shots",
+            "shots": [
+                {
+                    "id": 0,
+                    "start": 0.0,
+                    "end": 2.0,
+                    "frames": [{"index": 0, "time": 0.0, "path": "shot_0000_00.jpg"}],
+                }
+            ],
+        }
+    )
+    await on_event(
+        {
+            "type": "frame",
+            "shot_id": 0,
+            "index": 0,
+            "time": 0.0,
+            "path": "shot_0000_00.jpg",
+            "visual": {
+                "description": "a test scene",
+                "entities": [],
+                "actions": ["an object moves"],
+                "setting": "s",
+                "on_screen_text": None,
+            },
         }
     )
     tl = _timeline()
@@ -103,7 +133,10 @@ def test_upload_then_status_then_ask(client):
     job_id = resp.json()["job_id"]
 
     data = _wait_status(client, job_id, "done")
-    assert data["timeline"]["segments"][0]["visual"]["description"] == "a test scene"
+    frame = data["timeline"]["segments"][0]["frames"][0]
+    assert frame["time"] == 0.0
+    assert frame["visual"]["description"] == "a test scene"
+    assert frame["visual"]["actions"] == ["an object moves"]
 
     answer = client.post(f"/api/jobs/{job_id}/ask", json={"question": "eye color?"})
     assert answer.status_code == 200
@@ -144,7 +177,8 @@ def test_websocket_replays_and_streams_to_terminal(client):
             }:
                 break
 
-    assert "shot" in types_seen
+    assert "shots" in types_seen
+    assert "frame" in types_seen
     assert "timeline" in types_seen
     assert types_seen[-1] == "status"
 

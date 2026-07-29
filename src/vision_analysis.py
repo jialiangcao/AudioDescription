@@ -8,14 +8,15 @@ from google.genai import types
 from pydantic import BaseModel
 
 from prompts import (
+    FRAME_ANALYSIS_PROMPT,
     INLINE_OPTIMIZATION_PROMPT,
+    NARRATION_FRAMES_HEADER,
     NARRATION_GUIDELINES,
     NARRATION_HEADER,
     NARRATION_NO_PRIOR,
     NARRATION_PRIOR_HEADER,
     NO_CONTEXT,
     RETRY_OPTIMIZATION_PROMPT,
-    SCENE_GENERATION_PROMPT,
     SYSTEM_INSTRUCTION,
 )
 from timeline import NARRATION_WORDS_PER_SEC, Segment, Timeline
@@ -34,31 +35,43 @@ MODEL = "gemini-3.5-flash"
 MAX_OUTPUT_TOKENS = 1024
 THINKING_LEVEL = types.ThinkingLevel.LOW
 
-# How many Gemini calls to keep in flight at once within a job's shot-analysis
-# loop. Narration generation, by contrast, runs sequentially (each line is fed
-# the previous scenes' descriptions/dialogue/narration for continuity).
+# How many Gemini calls to keep in flight at once within a job's frame-analysis
+# loop. Every sampled frame is described independently, so this fans out across
+# all frames of all shots at once. Narration generation, by contrast, runs
+# sequentially (each line is fed the previous shots' frame descriptions,
+# dialogue, and narration for continuity).
 DEFAULT_CONCURRENCY = 4
 
-# How many preceding scenes to feed a narration line as continuity context.
+# How many preceding shots to feed a narration line as continuity context.
 NARRATION_CONTEXT_SCENES = 6
 
 
-class ShotAnalysis(BaseModel):
+class FrameAnalysis(BaseModel):
     description: str
     entities: list[str]
+    actions: list[str]
     setting: str
     on_screen_text: str | None
 
 
-async def analyze_keyframe(
-    client, keyframe_path, scene_duration=0.0, context=NO_CONTEXT
+async def analyze_frame(
+    client, frame_path, frame_time=0.0, frame_index=0, shot_duration=0.0
 ):
-    logger.debug("analyze_keyframe: %s -> %s", keyframe_path, MODEL)
-    with open(keyframe_path, "rb") as f:
+    """Describe a single sampled frame, on its own, via Gemini.
+
+    The frame is analyzed in isolation — no neighbouring frames, no prior shot
+    history — so the result is a faithful record of just this frame. Returns the
+    ``FrameAnalysis`` fields as a dict.
+    """
+    logger.debug("analyze_frame: %s (t=%.2fs) -> %s", frame_path, frame_time, MODEL)
+    with open(frame_path, "rb") as f:
         image_bytes = f.read()
 
-    prompt = SCENE_GENERATION_PROMPT.format(
-        scene_duration=scene_duration, context=context
+    prompt = FRAME_ANALYSIS_PROMPT.format(
+        frame_time=frame_time,
+        frame_index=frame_index,
+        shot_duration=shot_duration,
+        context=NO_CONTEXT,
     )
     response = await client.aio.models.generate_content(
         model=MODEL,
@@ -72,56 +85,86 @@ async def analyze_keyframe(
             # high-effort thinking plus the structured JSON result.
             max_output_tokens=MAX_OUTPUT_TOKENS,
             response_mime_type="application/json",
-            response_schema=ShotAnalysis,
+            response_schema=FrameAnalysis,
             thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
         ),
     )
 
     if response.text is None:
-        logger.error(
-            "analyze_keyframe: %s returned no text for %s", MODEL, keyframe_path
-        )
-        raise RuntimeError(f"{MODEL} returned no text for {keyframe_path}")
-    return ShotAnalysis.model_validate_json(response.text).model_dump()
+        logger.error("analyze_frame: %s returned no text for %s", MODEL, frame_path)
+        raise RuntimeError(f"{MODEL} returned no text for {frame_path}")
+    return FrameAnalysis.model_validate_json(response.text).model_dump()
 
 
 async def analyze_shots(
     shots,
-    on_shot: Callable[[dict], Awaitable[None]] | None = None,
+    on_frame: Callable[[dict, dict], Awaitable[None]] | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     client=None,
 ):
-    """Attach a ``visual`` analysis to every shot via Gemini, concurrently.
+    """Attach a ``visual`` analysis to every sampled frame of every shot.
 
-    Shots are analyzed with up to ``concurrency`` Gemini calls in flight at
-    once; ``on_shot`` (if given) is awaited with each shot as its analysis
-    completes, so callers can stream results. Completion order is not shot
-    order, so consumers must key off ``shot["id"]``.
+    Each frame gets its own Gemini call, with up to ``concurrency`` in flight
+    across the whole video; ``on_frame`` (if given) is awaited with
+    ``(shot, frame)`` as each frame's analysis completes, so callers can stream
+    results. Completion order is neither shot nor frame order, so consumers must
+    key off ``shot["id"]`` and ``frame["index"]``.
     """
     client = client or genai.Client()
     semaphore = asyncio.Semaphore(concurrency)
-    logger.info("analyze_shots: %d shot(s), concurrency=%d", len(shots), concurrency)
+    jobs = [(shot, frame) for shot in shots for frame in shot.get("frames", [])]
+    logger.info(
+        "analyze_shots: %d frame(s) across %d shot(s), concurrency=%d",
+        len(jobs),
+        len(shots),
+        concurrency,
+    )
 
-    async def _run(shot):
-        scene_duration = shot.get("end", 0.0) - shot.get("start", 0.0)
+    async def _run(shot, frame):
+        shot_duration = shot.get("end", 0.0) - shot.get("start", 0.0)
         async with semaphore:
-            shot["visual"] = await analyze_keyframe(
-                client, shot["keyframe"], scene_duration=scene_duration
+            frame["visual"] = await analyze_frame(
+                client,
+                frame["path"],
+                frame_time=frame["time"],
+                frame_index=frame["index"],
+                shot_duration=shot_duration,
             )
-        if on_shot is not None:
-            await on_shot(shot)
-        return shot
+        if on_frame is not None:
+            await on_frame(shot, frame)
 
-    await asyncio.gather(*(_run(shot) for shot in shots))
-    logger.info("analyze_shots: all %d shot(s) analyzed", len(shots))
+    await asyncio.gather(*(_run(shot, frame) for shot, frame in jobs))
+    logger.info("analyze_shots: all %d frame(s) analyzed", len(jobs))
     return shots
 
 
+def _frame_line(frame):
+    """One chronological line describing a single frame in a narration prompt."""
+    visual = frame.visual
+    if visual is None:
+        return f"- {frame.time:.2f}s: (not analyzed)"
+
+    parts = [f"- {frame.time:.2f}s: {visual.description}"]
+    if visual.actions:
+        parts.append(f"Actions: {'; '.join(visual.actions)}.")
+    if visual.on_screen_text:
+        parts.append(f'On-screen text: "{visual.on_screen_text}"')
+    return " ".join(parts)
+
+
 def _current_shot_block(segment):
-    """The CURRENT SHOT block: what's on screen plus any dialogue in this shot."""
-    lines = [segment.visual.description]
-    if segment.visual.on_screen_text:
-        lines.append(f'On-screen text: "{segment.visual.on_screen_text}"')
+    """The CURRENT SHOT block: the shot's frames in order, plus its dialogue.
+
+    Every sampled frame contributes its own description, actions, and on-screen
+    text, so the model can read the change across the shot and write a line that
+    covers the whole stretch rather than one instant.
+    """
+    lines = [
+        NARRATION_FRAMES_HEADER.format(
+            start=segment.start, end=segment.end, frame_count=len(segment.frames)
+        )
+    ]
+    lines.extend(_frame_line(frame) for frame in segment.frames)
     if segment.audio and segment.audio.transcript:
         lines.append(
             f'Dialogue in this shot (do not repeat): "{segment.audio.transcript}"'
@@ -130,19 +173,22 @@ def _current_shot_block(segment):
 
 
 def _prior_scenes_block(prior_scenes):
-    """The earlier-scenes continuity block from the accumulated scene history.
+    """The earlier-shots continuity block from the accumulated shot history.
 
-    ``prior_scenes`` is a list of ``{id, description, dialogue, narration}`` dicts
-    (oldest first). Each preceding scene contributes its visual description, its
-    dialogue, and the AD line already written for it, so the model can reuse
-    established names, avoid repeating visuals, and keep descriptions continuous.
+    ``prior_scenes`` is a list of ``{id, descriptions, dialogue, narration}``
+    dicts (oldest first), where ``descriptions`` is that shot's per-frame
+    descriptions in temporal order. Each preceding shot contributes those
+    descriptions, its dialogue, and the AD line already written for it, so the
+    model can reuse established names, avoid repeating visuals, and keep
+    descriptions continuous.
     """
     if not prior_scenes:
         return NARRATION_NO_PRIOR
 
     lines = [NARRATION_PRIOR_HEADER]
     for scene in prior_scenes:
-        parts = [f"- Shot {scene['id']}: {scene['description']}"]
+        summary = " → ".join(scene.get("descriptions") or []) or "(not analyzed)"
+        parts = [f"- Shot {scene['id']}: {summary}"]
         if scene.get("dialogue"):
             parts.append(f'Dialogue: "{scene["dialogue"]}"')
         if scene.get("narration"):
@@ -152,16 +198,18 @@ def _prior_scenes_block(prior_scenes):
 
 
 async def generate_narration(client, segment, max_words, prior_scenes=None):
-    """Write one AD narration line for ``segment``, aware of the preceding scenes.
+    """Write one AD narration line for ``segment``, from its whole frame sequence.
 
-    Builds the narration prompt from the current shot plus the accumulated
-    earlier-scene context (``prior_scenes``) so the line reuses established names,
-    doesn't repeat prior visuals, and stays continuous. Returns the raw line; the
-    caller may further condense it via ``optimize_narration`` to fit the gap.
+    Every frame sampled within the shot is attached as an image, in temporal
+    order, alongside the frame-by-frame analyses and the accumulated earlier-shot
+    context (``prior_scenes``) — so the line is the culmination of what happens
+    across the shot, reuses established names, doesn't repeat prior visuals, and
+    stays continuous. Returns the raw line; the caller may further condense it via
+    ``optimize_narration`` to fit the gap.
     """
     prompt = (
         NARRATION_HEADER.format(gap_sec=segment.narratable_gap_sec, max_words=max_words)
-        + "\n\nCURRENT SHOT:\n"
+        + "\n\n"
         + _current_shot_block(segment)
         + "\n\n"
         + _prior_scenes_block(prior_scenes)
@@ -169,15 +217,19 @@ async def generate_narration(client, segment, max_words, prior_scenes=None):
         + NARRATION_GUIDELINES
     )
 
-    with open(segment.keyframe, "rb") as f:
-        image_bytes = f.read()
+    # Frame images first, in the same chronological order as the prompt's frame
+    # list, so the model can line each image up with its description.
+    contents = []
+    for frame in segment.frames:
+        with open(frame.path, "rb") as f:
+            contents.append(
+                types.Part.from_bytes(data=f.read(), mime_type="image/jpeg")
+            )
+    contents.append(prompt)
 
     response = await client.aio.models.generate_content(
         model=MODEL,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            prompt,
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             # Reasoning shares the output budget, so keep it generous enough for
@@ -189,11 +241,12 @@ async def generate_narration(client, segment, max_words, prior_scenes=None):
 
     if response.text is None:
         logger.error(
-            "generate_narration: %s returned no text for segment keyframe %s",
+            "generate_narration: %s returned no text for segment %s (%d frame(s))",
             MODEL,
-            segment.keyframe,
+            segment.id,
+            len(segment.frames),
         )
-        raise RuntimeError(f"{MODEL} returned no text for {segment.keyframe}")
+        raise RuntimeError(f"{MODEL} returned no text for segment {segment.id}")
     return response.text.strip()
 
 
@@ -264,15 +317,15 @@ async def fill_narration_gaps(
     words_per_sec: float | None = None,
     client=None,
 ):
-    """Generate AD narration for every ``ad_eligible`` segment, in scene order.
+    """Generate AD narration for every ``ad_eligible`` segment, in shot order.
 
-    Unlike the shot-analysis stage, this runs sequentially: each narration line
-    is written with the preceding scenes' descriptions, dialogue, and narration
-    as context (a rolling window of ``NARRATION_CONTEXT_SCENES`` shots), so the
-    model reuses established names, avoids repeating earlier visuals, and keeps
-    the audio description continuous. Every shot — narrated or not — contributes
-    to that history. ``on_segment`` (if given) is awaited per narrated segment,
-    in id order.
+    Unlike the frame-analysis stage, this runs sequentially: each narration line
+    is written from its shot's whole frame sequence plus the preceding shots'
+    frame descriptions, dialogue, and narration as context (a rolling window of
+    ``NARRATION_CONTEXT_SCENES`` shots), so the model reuses established names,
+    avoids repeating earlier visuals, and keeps the audio description continuous.
+    Every shot — narrated or not — contributes to that history. ``on_segment``
+    (if given) is awaited per narrated segment, in id order.
     """
     words_per_sec = words_per_sec or NARRATION_WORDS_PER_SEC
     client = client or genai.Client()
@@ -311,7 +364,11 @@ async def fill_narration_gaps(
         history.append(
             {
                 "id": segment.id,
-                "description": segment.visual.description,
+                "descriptions": [
+                    frame.visual.description
+                    for frame in segment.frames
+                    if frame.visual is not None
+                ],
                 "dialogue": dialogue,
                 "narration": segment.ad_narration,
             }

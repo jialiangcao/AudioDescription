@@ -3,9 +3,10 @@ import pytest
 import timeline as timeline_module
 from timeline import (
     AudioAnalysis,
+    Frame,
+    FrameAnalysis,
     Segment,
     Timeline,
-    VisualAnalysis,
     _overlap_sec,
     _speech_seconds_within,
     _transcript_within,
@@ -62,18 +63,27 @@ class _FakeCapture:
         pass
 
 
+def _frame(shot_id, index, time):
+    return {
+        "index": index,
+        "time": time,
+        "path": f"shot_{shot_id:04d}_{index:02d}.jpg",
+        "visual": {
+            "description": f"description {shot_id}.{index}",
+            "entities": [],
+            "actions": ["something happens"],
+            "setting": "a setting",
+            "on_screen_text": None,
+        },
+    }
+
+
 def _shot(id_, start, end):
     return {
         "id": id_,
         "start": start,
         "end": end,
-        "keyframe": f"shot_{id_:04d}.jpg",
-        "visual": {
-            "description": f"description {id_}",
-            "entities": [],
-            "setting": "a setting",
-            "on_screen_text": None,
-        },
+        "frames": [_frame(id_, 0, start), _frame(id_, 1, (start + end) / 2)],
     }
 
 
@@ -107,6 +117,26 @@ def test_build_timeline_computes_duration_and_ad_eligibility(monkeypatch):
     assert second.ad_eligible is False
 
 
+def test_build_timeline_carries_every_frame_with_its_own_analysis(monkeypatch):
+    monkeypatch.setattr(
+        timeline_module.cv2,
+        "VideoCapture",
+        lambda path: _FakeCapture(fps=10.0, frame_count=40),
+    )
+
+    tl = build_timeline("video.mp4", [_shot(0, 0.0, 2.0), _shot(1, 2.0, 4.0)])
+
+    for segment in tl.segments:
+        assert [f.index for f in segment.frames] == [0, 1]
+        for frame in segment.frames:
+            # Each frame keeps its own timestamp and its own analysis — there is
+            # no shot-level rollup.
+            assert segment.start <= frame.time <= segment.end
+            assert frame.visual is not None
+            assert frame.visual.description == f"description {segment.id}.{frame.index}"
+            assert frame.visual.actions == ["something happens"]
+
+
 def test_build_timeline_sizes_gap_to_longest_silence_not_total(monkeypatch):
     monkeypatch.setattr(
         timeline_module.cv2,
@@ -136,10 +166,20 @@ def test_save_and_load_timeline_roundtrip(tmp_path):
                 id=0,
                 start=0.0,
                 end=2.0,
-                keyframe="shot_0000.jpg",
-                visual=VisualAnalysis(
-                    description="d", entities=[], setting="s", on_screen_text=None
-                ),
+                frames=[
+                    Frame(
+                        index=0,
+                        time=0.0,
+                        path="shot_0000_00.jpg",
+                        visual=FrameAnalysis(
+                            description="d",
+                            entities=[],
+                            actions=["a hand lifts"],
+                            setting="s",
+                            on_screen_text=None,
+                        ),
+                    )
+                ],
                 audio=AudioAnalysis(
                     has_speech=False, transcript=None, silence_ratio=1.0
                 ),

@@ -5,9 +5,13 @@ prompt with AD guidelines, scene-level generation, and inline optimization).
 The templates are used verbatim except for the JSON/output-format instructions,
 which are adapted to the structures this pipeline consumes:
 
-* the scene-level generation prompt emits a single JSON object matching
-  ``vision_analysis.ShotAnalysis`` (description/entities/setting/on_screen_text)
-  instead of the paper's ``start_time``/``type``/``text`` event array;
+* the paper's scene-level generation prompt is applied per *sampled frame* rather
+  than per scene, and emits a single JSON object matching
+  ``vision_analysis.FrameAnalysis``
+  (description/entities/actions/setting/on_screen_text) instead of the paper's
+  ``start_time``/``type``/``text`` event array;
+* the narration prompt is fed the shot's whole frame sequence, so the AD line
+  describes what happens across the shot rather than one instant;
 * everything else — the guidelines, the system message, the character-naming
   rules, and the entire inline-optimization prompt — is left as written.
 """
@@ -40,17 +44,22 @@ You must follow the audio description guidelines below.
 SYSTEM_INSTRUCTION = _SYSTEM_MESSAGE.format(guidelines=AD_GUIDELINES)
 
 
-# --- Scene-level generation prompt (Appendix A.2) ---------------------------
-# Verbatim except the JSON/output instructions, adapted to emit one ShotAnalysis
-# object rather than the paper's array of timed Text-on-Screen / Visual events.
+# --- Frame-level generation prompt (Appendix A.2) ---------------------------
+# The paper's scene-level prompt, applied per sampled frame. Verbatim except the
+# JSON/output instructions, adapted to emit one FrameAnalysis object rather than
+# the paper's array of timed Text-on-Screen / Visual events, and with the added
+# `actions` field. Each frame is analyzed independently and concurrently, so the
+# analysis must stand on its own — this is also exactly what the frontend's
+# frame-by-frame view displays beside the image.
 
-SCENE_GENERATION_PROMPT = """SCENE DURATION: {scene_duration:.2f} seconds
+FRAME_ANALYSIS_PROMPT = """FRAME TIMESTAMP: {frame_time:.2f} seconds \
+(frame {frame_index} of a {shot_duration:.2f}-second shot)
 
 CONTEXT:
 {context}
 
-You are analyzing a video scene. Identify specific characters, locations, and any \
-important elements mentioned in the context.
+You are analyzing a single frame of a video. Identify specific characters, locations, and \
+any important elements mentioned in the context.
 
 First, capture Text on Screen:
 - Capture ALL visible on-screen text.
@@ -60,19 +69,27 @@ INCLUDE: Titles, headings, names; informational text; important dates or events.
 EXCLUDE: Brand logos and watermarks; network logos; social media handles; copyright notices.
 
 Second, generate the visual description:
-- Provide contextually rich visual description of the scene using concise wording.
+- Provide contextually rich visual description of this frame using concise wording.
 - Describe each action in detail.
 - ALWAYS use specific character names from context (not "person" or "woman").
-- Focus on key actions, settings, and objects not mentioned in a previous description.
+- Focus on key actions, settings, and objects.
 - DO NOT describe Text on Screen.
 
+Third, list the actions:
+- One short phrase per distinct action visible in this frame, e.g. "Maria tucks a letter \
+into her coat".
+- Report only what this frame actually shows; do not infer motion you cannot see, and do \
+not guess what happens before or after.
+- Return an empty array if nothing is happening — a static frame is a valid result.
+
 OUTPUT FORMAT (JSON object):
-  - description     (the visual description text)
-  - entities        (array of the specific characters and objects present)
-  - setting         (the location or setting of the scene)
+  - description     (the visual description of this frame)
+  - entities        (array of the specific characters and objects present in this frame)
+  - actions         (array of short phrases, one per action visible in this frame)
+  - setting         (the location or setting shown in this frame)
   - on_screen_text  (all captured on-screen text, or null if there is none)"""
 
-# Default context when no prior narrative context is available (per-keyframe
+# Default context when no prior narrative context is available (per-frame
 # analysis runs concurrently, so there is no accumulated scene history to feed).
 NO_CONTEXT = (
     "(No prior narrative context is available; identify the characters, location, "
@@ -85,9 +102,12 @@ NO_CONTEXT = (
 # Split into a header (dynamic: gap length + word budget) and a static guidelines
 # block so the current-shot and earlier-scene context can be concatenated in
 # safely (their text may contain braces, which str.format would choke on). The
-# earlier-scene context gives the model the prior descriptions, dialogue, and
-# narration so it maintains continuity: reusing established names, not repeating
-# visuals, and building on what came before.
+# current-shot context is the shot's whole sampled frame sequence — every frame's
+# image plus its independent analysis, in temporal order — so the line describes
+# the arc of the shot rather than one instant. The earlier-scene context gives the
+# model the prior shots' frame descriptions, dialogue, and narration so it
+# maintains continuity: reusing established names, not repeating visuals, and
+# building on what came before.
 
 NARRATION_HEADER = """You are writing a single line of audio description (AD) narration for a \
 blind or low-vision (BLV) viewer. It will be spoken during a {gap_sec:.1f}-second speech-free \
@@ -95,8 +115,18 @@ gap in the current shot, so it must fit that time — about {max_words} words or
 complements the video: it conveys essential visual information the viewer cannot see, without \
 restating the dialogue or narrating the filmmaking."""
 
+# Header for the current-shot block: the shot's sampled frames in temporal order.
+# The frame images are attached in the same order, ahead of the prompt text.
+NARRATION_FRAMES_HEADER = """CURRENT SHOT: {start:.2f}s–{end:.2f}s, sampled at {frame_count} \
+frame(s), listed and attached in chronological order. Each frame was described independently, \
+so the same person or object may be worded differently across frames — treat them as one \
+continuous stretch of action and write the culmination of what happens across all of them, not \
+a description of any single frame."""
+
 NARRATION_GUIDELINES = """GUIDELINES:
-- Describe only what is visible now, in the present tense, concisely and factually.
+- Describe what happens across the shot, in the present tense, concisely and factually.
+- Where the frames show change, describe the action that carries through them; where they are \
+static, describe the state rather than inventing movement.
 - Lead with the most important information: who, what, where, and the key action.
 - Reuse the names and places established in earlier scenes; never re-introduce someone already \
 named (e.g. do not call a named character "a man" or "a woman" again).
@@ -121,12 +151,13 @@ details that also comment on the filmmaking.
 Return only the narration line — no quotation marks, labels, or explanation."""
 
 # Header for the earlier-scene continuity block, and the fallback when the shot
-# is the first one described.
+# is the first one described. Each earlier shot contributes its frame descriptions
+# in order, so continuity is built from the same frame-level record.
 NARRATION_PRIOR_HEADER = (
-    "EARLIER SCENES (oldest first) — maintain continuity with these and do not repeat their "
+    "EARLIER SHOTS (oldest first) — maintain continuity with these and do not repeat their "
     "information:"
 )
-NARRATION_NO_PRIOR = "EARLIER SCENES: none — this is the first described shot."
+NARRATION_NO_PRIOR = "EARLIER SHOTS: none — this is the first described shot."
 
 
 # --- Inline optimization prompt (Appendix A.3) ------------------------------

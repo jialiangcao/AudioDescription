@@ -2,7 +2,7 @@ import numpy as np
 import soundfile as sf
 
 from ad_track import AD_TRACK_FILENAME, build_ad_track
-from timeline import AudioAnalysis, Segment, Timeline, VisualAnalysis
+from timeline import AudioAnalysis, Frame, FrameAnalysis, Segment, Timeline
 from tts import SAMPLE_RATE
 
 
@@ -11,10 +11,20 @@ def _segment(id_, start, end, *, narration_audio=None, start_sec=None, dur=None)
         id=id_,
         start=start,
         end=end,
-        keyframe="k.jpg",
-        visual=VisualAnalysis(
-            description="d", entities=[], setting="s", on_screen_text=None
-        ),
+        frames=[
+            Frame(
+                index=0,
+                time=start,
+                path="k.jpg",
+                visual=FrameAnalysis(
+                    description="d",
+                    entities=[],
+                    actions=[],
+                    setting="s",
+                    on_screen_text=None,
+                ),
+            )
+        ],
         audio=AudioAnalysis(has_speech=False, transcript=None, silence_ratio=1.0),
         ad_eligible=narration_audio is not None,
         narratable_gap_sec=dur,
