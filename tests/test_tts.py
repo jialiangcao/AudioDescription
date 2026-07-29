@@ -1,7 +1,7 @@
 import numpy as np
 
 import tts
-from timeline import AudioAnalysis, Segment, Timeline, VisualAnalysis
+from timeline import AudioAnalysis, Frame, FrameAnalysis, Segment, Timeline
 
 
 def _segment(id_, ad_eligible, ad_narration, narratable_gap_sec):
@@ -9,10 +9,20 @@ def _segment(id_, ad_eligible, ad_narration, narratable_gap_sec):
         id=id_,
         start=float(id_),
         end=float(id_ + 1),
-        keyframe="k.jpg",
-        visual=VisualAnalysis(
-            description="d", entities=[], setting="s", on_screen_text=None
-        ),
+        frames=[
+            Frame(
+                index=0,
+                time=float(id_),
+                path="k.jpg",
+                visual=FrameAnalysis(
+                    description="d",
+                    entities=[],
+                    actions=[],
+                    setting="s",
+                    on_screen_text=None,
+                ),
+            )
+        ],
         audio=AudioAnalysis(has_speech=False, transcript=None, silence_ratio=1.0),
         ad_eligible=ad_eligible,
         narratable_gap_sec=narratable_gap_sec,

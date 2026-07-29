@@ -25,7 +25,10 @@ def detect_shots(video_path, threshold=27.0):
             "detect_shots: no cuts found, treating whole video as one shot (%s)",
             video.duration,
         )
-        return [(0.0, video.duration)]
+        # video.duration is a FrameTimecode; unwrap it to plain float seconds so
+        # callers get the same shape as the scene-list branch below.
+        duration = video.duration.seconds if video.duration else 0.0
+        return [(0.0, duration)]
 
     logger.debug("detect_shots: %d shot(s) detected", len(scene_list))
     return [(start.seconds, end.seconds) for start, end in scene_list]
@@ -34,10 +37,11 @@ def detect_shots(video_path, threshold=27.0):
 def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
     """Extract frames sampled every `interval_sec` within each shot.
 
-    Returns a list of shot dicts: {id, start, end, keyframe, keyframes}, where
-    `keyframe` is the single sampled frame closest to the shot's midpoint (kept
-    for backward compatibility with the rest of the pipeline) and `keyframes` is
-    every sampled frame path in the shot, in temporal order.
+    Returns a list of shot dicts: `{id, start, end, frames}`, where `frames` is
+    every sampled frame in the shot in temporal order, each recorded as
+    `{index, time, path}` — `index` is its position within the shot and `time`
+    its absolute timestamp in the video. No frame is privileged: every one is
+    described on its own by `vision_analysis.analyze_shots`.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -61,35 +65,37 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
         if not timestamps:
             timestamps = [start]
 
-        midpoint = (start + end) / 2
-        paths = []
+        frames = []
         for t in timestamps:
             frame_idx = int(t * fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ok, frame = cap.read()
             if not ok:
                 continue
-            path = os.path.join(out_dir, f"shot_{i:04d}_{len(paths):02d}.jpg")
+            index = len(frames)
+            path = os.path.join(out_dir, f"shot_{i:04d}_{index:02d}.jpg")
             cv2.imwrite(path, frame)
-            paths.append((t, path))
+            frames.append({"index": index, "time": round(t, 2), "path": path})
 
-        if not paths:
+        if not frames:
             logger.warning("extract_keyframes: shot %d yielded no readable frames", i)
             continue
 
-        keyframe = min(paths, key=lambda tp: abs(tp[0] - midpoint))[1]
         shot_records.append(
             {
                 "id": i,
                 "start": round(start, 2),
                 "end": round(end, 2),
-                "keyframe": keyframe,
-                "keyframes": [p for _, p in paths],
+                "frames": frames,
             }
         )
 
     cap.release()
-    logger.debug("extract_keyframes: produced %d shot record(s)", len(shot_records))
+    logger.debug(
+        "extract_keyframes: produced %d shot record(s), %d frame(s) total",
+        len(shot_records),
+        sum(len(r["frames"]) for r in shot_records),
+    )
     return shot_records
 
 

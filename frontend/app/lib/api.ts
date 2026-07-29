@@ -25,11 +25,24 @@ export function describedVideoUrl(jobId: string): string {
   return `${API_BASE}/api/jobs/${jobId}/described`;
 }
 
-export interface VisualAnalysis {
+/** The vision model's analysis of one sampled frame, on its own. */
+export interface FrameAnalysis {
   description: string;
   entities: string[];
+  actions: string[];
   setting: string;
   on_screen_text: string | null;
+}
+
+export interface Frame {
+  /** Position of the frame within its shot. */
+  index: number;
+  /** Absolute timestamp in the video, in seconds. */
+  time: number;
+  /** Server-side path (or bare filename); pass through frameUrl(). */
+  path: string;
+  /** null until this frame's vision call lands. */
+  visual: FrameAnalysis | null;
 }
 
 export interface AudioAnalysis {
@@ -42,8 +55,8 @@ export interface Segment {
   id: number;
   start: number;
   end: number;
-  keyframe: string;
-  visual: VisualAnalysis;
+  /** Every frame sampled within the shot, in temporal order. */
+  frames: Frame[];
   audio: AudioAnalysis | null;
   ad_eligible: boolean | null;
   narratable_gap_sec: number | null;
@@ -76,7 +89,26 @@ export type JobStatus =
 
 export type PipelineEvent =
   | { type: "stage"; stage: string; status: string; [k: string]: unknown }
-  | { type: "shot"; shot: Partial<Segment> & { id: number } }
+  // The shot/frame skeleton, sent as soon as frames are extracted — before any
+  // frame has been described — so timestamps and images can render immediately.
+  | {
+      type: "shots";
+      shots: {
+        id: number;
+        start: number;
+        end: number;
+        frames: Omit<Frame, "visual">[];
+      }[];
+    }
+  // One frame's analysis. Arrives out of order; key off shot_id + index.
+  | {
+      type: "frame";
+      shot_id: number;
+      index: number;
+      time: number;
+      path: string;
+      visual: FrameAnalysis | null;
+    }
   | { type: "timeline"; timeline: Timeline }
   | { type: "narration"; segment_id: number; text: string }
   | {

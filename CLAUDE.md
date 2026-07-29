@@ -4,17 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`adesc` generates audio-description (AD) narration for video: it detects shots, describes each
-shot visually, transcribes dialogue, finds speech-free gaps long enough to narrate, asks Gemini
-to write a narration line sized to fit each gap, synthesizes that line to speech with Kokoro, and
+`adesc` generates audio-description (AD) narration for video: it detects shots, samples frames
+across each shot and describes **every** frame visually, transcribes dialogue, finds speech-free
+gaps long enough to narrate, asks Gemini to write a narration line — sized to fit each gap and
+drawn from the shot's whole frame sequence — synthesizes that line to speech with Kokoro, and
 mixes the narration back into the video's soundtrack so the result can be watched in one pass.
 It also features interactive Q&A.
 
 It runs as a web app: a FastAPI backend (`src/`) drives the pipeline per uploaded video and
 streams progress over a websocket; a Next.js frontend (`frontend/`) provides drag-and-drop
-upload, a live view of the generated audio-description segments, a player for the described video,
-and the Q&A box. There is no
-CLI entrypoint — the old `src/main.py` was removed in favor of the web server.
+upload, a frame-by-frame view (every extracted frame with its timestamp and its own visual
+analysis beside it, grouped by shot, with the shot's narration underneath), a player for the
+described video, and the Q&A box.
+There is no CLI entrypoint — the old `src/main.py` was removed in favor of the web server.
 
 ## Commands
 
@@ -28,7 +30,9 @@ cd frontend && npm install && npm run dev                          # frontend @ 
 
 `--app-dir src` puts `src/` on `sys.path`, preserving the flat-import convention (below). Use a
 **single** worker process only — the `JobStore` is in-memory, so `--workers > 1` would split
-jobs across processes. Requires `ffmpeg`/`ffprobe` on PATH (audio extraction), `espeak-ng` on
+jobs across processes. Note that stage 2 issues one Gemini call **per sampled frame**, so a job's
+API cost scales with total frame count, not shot count — `segmentation.extract_keyframes`'s
+`interval_sec` (2.0s) is the knob. Requires `ffmpeg`/`ffprobe` on PATH (audio extraction), `espeak-ng` on
 PATH (Kokoro's G2P fallback for narration TTS), and a `GEMINI_API_KEY` in `.env` (loaded via
 `python-dotenv`; the server boots without one and only fails a job when it actually calls Gemini).
 
@@ -43,25 +47,30 @@ fixed pool of worker tasks. `src/jobs.py` holds the in-memory `JobStore` (job st
 snapshot, append-only event log for websocket replay, per-job subscriber fan-out, TTL sweep, and
 crash recovery from a mirrored `status.json`). `src/pipeline.py::run_pipeline()` orchestrates the
 eight stages below against job-scoped paths and reports progress via an async `on_event` callback
-(stage markers, per-shot vision, the assembled timeline, per-segment narration text, per-segment
-narration audio, the combined AD track, the final described video); CPU-bound stages run via
-`asyncio.to_thread`, Gemini stages run natively async.
+(stage markers, the shot/frame skeleton, per-frame vision, the assembled timeline, per-segment
+narration text, per-segment narration audio, the combined AD track, the final described video);
+CPU-bound stages run via `asyncio.to_thread`, Gemini stages run natively async.
 The routes are: `POST /api/jobs` (upload), `WS /api/jobs/{id}/events` (live stream + replay),
 `GET /api/jobs/{id}` (status + timeline snapshot), `GET /api/jobs/{id}/frames/{filename}`
-(keyframe jpgs, path-traversal checked), `GET /api/jobs/{id}/narration/{filename}` (synthesized
+(sampled frame jpgs, path-traversal checked), `GET /api/jobs/{id}/narration/{filename}` (synthesized
 narration wavs, path-traversal checked), `GET /api/jobs/{id}/described` (the muxed video —
 a fixed artifact per job, so no filename parameter), `POST /api/jobs/{id}/ask` (Q&A).
 
 The eight stages, each in its own module under `src/`:
 
 1. **`segmentation.py`** — `segment_video()` uses PySceneDetect (`ContentDetector`) to find shot
-   (camera cut) boundaries, then grabs one midpoint keyframe per shot via OpenCV. Produces a
-   list of shot dicts: `{id, start, end, keyframe}`.
-2. **`vision_analysis.py`** — `analyze_shots()` is `async`: it sends each keyframe to Gemini
-   (`client.aio`, structured JSON-schema output) to get `description`, `entities`, `setting`,
-   `on_screen_text`, with up to `DEFAULT_CONCURRENCY` calls in flight via an `asyncio.Semaphore`.
-   An optional `on_shot` callback fires per shot as each completes — completion order is not shot
-   order, so consumers must key off `shot["id"]`.
+   (camera cut) boundaries, then samples a frame every `interval_sec` (2.0s) within each shot via
+   OpenCV. Produces a list of shot dicts: `{id, start, end, frames}`, where each frame is
+   `{index, time, path}` — `index` its position within the shot, `time` its absolute timestamp in
+   the video. No frame is privileged; the old midpoint `keyframe` concept is gone.
+2. **`vision_analysis.py`** — `analyze_shots()` is `async` and works **per frame**: it sends every
+   sampled frame to Gemini (`client.aio`, structured JSON-schema output) to get `description`,
+   `entities`, `actions`, `setting`, `on_screen_text`, with up to `DEFAULT_CONCURRENCY` calls in
+   flight across the whole video via an `asyncio.Semaphore`. Each frame is analyzed in isolation
+   (`NO_CONTEXT`, no neighbouring frames), so its analysis is a faithful record of that frame
+   alone — which is exactly what the frontend displays. There is no shot-level rollup. An optional
+   `on_frame(shot, frame)` callback fires per frame as each completes — completion order is
+   neither shot nor frame order, so consumers must key off `shot["id"]` and `frame["index"]`.
 3. **`audio_extract.py`** — `extract_audio()` shells out to `ffmpeg` to pull a 16kHz mono WAV
    (the format Silero VAD and Whisper expect). Raises `NoAudioStreamError` if the source video
    has no audio track; `pipeline.py` catches this and skips stages 4–5, leaving `ad_eligible`
@@ -72,13 +81,19 @@ The eight stages, each in its own module under `src/`:
    drops any Whisper segment that doesn't overlap a Silero speech region. This VAD-filtering step
    exists specifically to suppress Whisper hallucinating text over music/silence.
 6. **`timeline.py`** — `build_timeline()` merges shots + speech regions + transcript into a
-   pydantic `Timeline` (list of `Segment`s). Per segment it computes `silence_ratio` (fraction of
-   the shot with no detected speech), `narratable_gap_sec` (silence_ratio × shot duration), and
+   pydantic `Timeline` (list of `Segment`s, each holding its `frames: list[Frame]` with their
+   `FrameAnalysis`). Per segment it computes `silence_ratio` (fraction of the shot with no
+   detected speech), `narratable_gap_sec` (the longest contiguous speech-free span), and
    `ad_eligible` (gap ≥ `MIN_NARRATABLE_GAP_SEC`, currently 2.0s). Then
-   `vision_analysis.fill_narration_gaps()` (also `async`, same semaphore + optional `on_segment`
-   callback) calls Gemini again for each `ad_eligible` segment, capping narration length via
-   `NARRATION_WORDS_PER_SEC` (2.5 wps) applied to `narratable_gap_sec`, and feeding neighboring
-   dialogue as context so narration doesn't repeat what's already said.
+   `vision_analysis.fill_narration_gaps()` (also `async`, with an optional `on_segment` callback)
+   calls Gemini again for each `ad_eligible` segment. Narration is the **culmination of the whole
+   shot**: every sampled frame is attached as an image, in temporal order, alongside its
+   description/actions/on-screen text, so the line describes the arc across the shot rather than
+   one instant. Length is capped via `NARRATION_WORDS_PER_SEC` (2.5 wps) applied to
+   `narratable_gap_sec`, and neighboring dialogue is fed as context so narration doesn't repeat
+   what's already said. This stage runs **sequentially** (unlike stage 2): each line receives the
+   preceding `NARRATION_CONTEXT_SCENES` shots' frame descriptions, dialogue, and narration for
+   continuity.
 7. **`tts.py`** — `synthesize_narration()` is `async`: for each segment with `ad_narration` set,
    it runs the line through Kokoro-82M (`kokoro.KPipeline`, voice `VOICE`, 24kHz) via
    `asyncio.to_thread` and writes a WAV under the job's `narration/`. Since `narratable_gap_sec`
@@ -115,13 +130,14 @@ than introducing a package layout, unless deliberately migrating away from this.
 ### I/O layout
 
 - Per-job temp dirs under `<tempdir>/adesc-jobs/<job_id>/` hold the uploaded `source.<ext>`, the
-  extracted `audio.wav`, `frames/shot_XXXX.jpg` keyframes, `narration/shot_XXXX.wav` synthesized
-  narration clips, `narration/ad_track.wav` (the combined AD-only track), the muxed
-  `described.mp4`, and a mirrored `status.json` for crash recovery. They are swept after
-  `JOB_TTL_SEC` (kept until then so Q&A can read the frames and the frontend can play the
-  narration clips and the described video). The old fixed `src/in`/`src/out` layout is gone.
+  extracted `audio.wav`, `frames/shot_XXXX_YY.jpg` sampled frames (`XXXX` = shot id, `YY` = frame
+  index within the shot), `narration/shot_XXXX.wav` synthesized narration clips,
+  `narration/ad_track.wav` (the combined AD-only track), the muxed `described.mp4`, and a mirrored
+  `status.json` for crash recovery. They are swept after `JOB_TTL_SEC` (kept until then so Q&A can
+  read the frames and the frontend can serve the frame-by-frame view, play the narration clips, and
+  play the described video). The old fixed `src/in`/`src/out` layout is gone.
 
-Both Gemini calls (shot description and gap narration) use the same `MODEL` constant in
+Both Gemini calls (frame description and gap narration) use the same `MODEL` constant in
 `vision_analysis.py`.
 
 ### Logging
@@ -130,7 +146,8 @@ Both Gemini calls (shot description and gap narration) use the same `MODEL` cons
 calls it once at import (after `load_dotenv()`). Every module logs through its own
 `logging.getLogger(__name__)` and never touches handlers/levels itself, so tests and embedders keep
 control. Level comes from the `ADESC_LOG_LEVEL` env var (default `INFO`; use `DEBUG` for the
-verbose per-shot / per-frame / per-segment traces, `WARNING` for problems only). Convention: `INFO`
+verbose per-shot / per-frame / per-segment traces, `WARNING` for problems only; note that `DEBUG` now emits one line per
+sampled frame, not one per shot). Convention: `INFO`
 for stage boundaries and job-lifecycle transitions, `DEBUG` for per-item detail, `WARNING` for
 recoverable oddities (no audio stream, no cuts detected, narration overflow), `ERROR` /
 `logger.exception` for failures. Noisy third-party loggers (`httpx`, `faster_whisper`, …) are

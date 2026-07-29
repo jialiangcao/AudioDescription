@@ -34,16 +34,41 @@ logger = logging.getLogger(__name__)
 OnEvent = Callable[[dict], Awaitable[None]]
 
 
-def _shot_event(shot: dict) -> dict:
+def _shots_event(shots: list[dict]) -> dict:
+    """The shot/frame skeleton, emitted before any frame has been described.
+
+    Lets the client show every extracted frame with its timestamp immediately;
+    the per-frame ``frame`` events then fill in each frame's analysis.
+    """
     return {
-        "type": "shot",
-        "shot": {
-            "id": shot["id"],
-            "start": shot["start"],
-            "end": shot["end"],
-            "keyframe": shot["keyframe"],
-            "visual": shot.get("visual"),
-        },
+        "type": "shots",
+        "shots": [
+            {
+                "id": shot["id"],
+                "start": shot["start"],
+                "end": shot["end"],
+                "frames": [
+                    {
+                        "index": frame["index"],
+                        "time": frame["time"],
+                        "path": Path(frame["path"]).name,
+                    }
+                    for frame in shot["frames"]
+                ],
+            }
+            for shot in shots
+        ],
+    }
+
+
+def _frame_event(shot: dict, frame: dict) -> dict:
+    return {
+        "type": "frame",
+        "shot_id": shot["id"],
+        "index": frame["index"],
+        "time": frame["time"],
+        "path": Path(frame["path"]).name,
+        "visual": frame.get("visual"),
     }
 
 
@@ -56,12 +81,13 @@ async def run_pipeline(
     """Run the full AD pipeline for one job.
 
     ``on_event`` is awaited on the event loop with dict events: ``stage``
-    (start/done markers), ``shot`` (per-shot vision result), ``timeline`` (the
-    assembled timeline before narration), ``narration`` (per-segment AD text),
-    ``narration_audio`` (per-segment synthesized clip: filename, duration,
-    overflow), ``ad_track`` (the combined AD-only track) and ``described_video``
-    (the final video with narration mixed in). Shot and narration events arrive
-    out of order — consumers must key off the ``id`` field.
+    (start/done markers), ``shots`` (the shot/frame skeleton with timestamps),
+    ``frame`` (one frame's vision result), ``timeline`` (the assembled timeline
+    before narration), ``narration`` (per-segment AD text), ``narration_audio``
+    (per-segment synthesized clip: filename, duration, overflow), ``ad_track``
+    (the combined AD-only track) and ``described_video`` (the final video with
+    narration mixed in). Frame and narration events arrive out of order —
+    consumers must key off ``shot_id``/``index`` and ``segment_id``.
     """
     video_path = Path(video_path)
     frames_dir = job_dir / "frames"
@@ -70,36 +96,42 @@ async def run_pipeline(
     logger.info("pipeline start: %s", video_path)
 
     # 1. Shot segmentation (CPU-bound: PySceneDetect + OpenCV).
-    logger.info("stage 1/8 segmentation: detecting shots + keyframes")
+    logger.info("stage 1/8 segmentation: detecting shots + sampling frames")
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
     t0 = time.monotonic()
     shots = await asyncio.to_thread(
         segment_video, str(video_path), out_dir=str(frames_dir)
     )
+    frame_count = sum(len(shot["frames"]) for shot in shots)
     logger.info(
-        "stage 1/8 segmentation done: %d shot(s) in %.1fs",
+        "stage 1/8 segmentation done: %d shot(s), %d frame(s) in %.1fs",
         len(shots),
+        frame_count,
         time.monotonic() - t0,
     )
+    # Publish the skeleton first so the client can show every extracted frame and
+    # its timestamp while the descriptions are still being generated.
+    await on_event(_shots_event(shots))
     await on_event(
         {
             "type": "stage",
             "stage": "segmentation",
             "status": "done",
             "count": len(shots),
+            "frame_count": frame_count,
         }
     )
 
-    # 2. Vision analysis (network-bound Gemini calls, run concurrently).
-    logger.info("stage 2/8 vision: describing %d shot(s) via Gemini", len(shots))
+    # 2. Vision analysis: one Gemini call per sampled frame, run concurrently.
+    logger.info("stage 2/8 vision: describing %d frame(s) via Gemini", frame_count)
     await on_event({"type": "stage", "stage": "vision", "status": "start"})
     t0 = time.monotonic()
 
-    async def _on_shot(shot: dict) -> None:
-        logger.debug("shot %s described", shot["id"])
-        await on_event(_shot_event(shot))
+    async def _on_frame(shot: dict, frame: dict) -> None:
+        logger.debug("shot %s frame %s described", shot["id"], frame["index"])
+        await on_event(_frame_event(shot, frame))
 
-    shots = await analyze_shots(shots, on_shot=_on_shot, client=client)
+    shots = await analyze_shots(shots, on_frame=_on_frame, client=client)
     logger.info("stage 2/8 vision done in %.1fs", time.monotonic() - t0)
     await on_event({"type": "stage", "stage": "vision", "status": "done"})
 

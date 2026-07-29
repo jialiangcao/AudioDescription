@@ -9,7 +9,7 @@ from jobs import (
     Job,
     JobStore,
 )
-from timeline import AudioAnalysis, Segment, Timeline, VisualAnalysis
+from timeline import AudioAnalysis, Frame, FrameAnalysis, Segment, Timeline
 
 
 def _store(tmp_path) -> JobStore:
@@ -25,10 +25,20 @@ def _timeline() -> Timeline:
                 id=0,
                 start=0.0,
                 end=2.0,
-                keyframe="shot_0000.jpg",
-                visual=VisualAnalysis(
-                    description="d", entities=[], setting="s", on_screen_text=None
-                ),
+                frames=[
+                    Frame(
+                        index=0,
+                        time=0.0,
+                        path="shot_0000_00.jpg",
+                        visual=FrameAnalysis(
+                            description="d",
+                            entities=[],
+                            actions=[],
+                            setting="s",
+                            on_screen_text=None,
+                        ),
+                    )
+                ],
                 audio=AudioAnalysis(
                     has_speech=False, transcript=None, silence_ratio=1.0
                 ),
