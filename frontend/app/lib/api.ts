@@ -136,10 +136,31 @@ export async function uploadVideo(file: File): Promise<string> {
   return (await resp.json()).job_id;
 }
 
+/** One entry of the Q&A agent trajectory: which agent ran (or a reflection /
+ * finish marker), why, and what it returned. Mirrors qa.QAResult history. */
+export interface TraceEntry {
+  action: string;
+  reason?: string;
+  instruct?: string;
+  result?: string;
+  answer?: string;
+  assessment?: string;
+  comment?: string;
+  [k: string]: unknown;
+}
+
+/** Mirror of the backend's AskResponse (qa.QAResult). */
+export interface AskResult {
+  answer: string | null;
+  status: string;
+  cycles: number;
+  history: TraceEntry[];
+}
+
 export async function askQuestion(
   jobId: string,
   question: string,
-): Promise<string> {
+): Promise<AskResult> {
   const resp = await fetch(`${API_BASE}/api/jobs/${jobId}/ask`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -149,5 +170,5 @@ export async function askQuestion(
     const detail = await resp.json().catch(() => ({}));
     throw new Error(detail.detail ?? `request failed (${resp.status})`);
   }
-  return (await resp.json()).answer;
+  return (await resp.json()) as AskResult;
 }

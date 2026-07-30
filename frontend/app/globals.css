@@ -333,6 +333,61 @@ button:disabled {
   padding: 14px 16px;
 }
 
+/* Q&A reasoning trace: one card per agent cycle. */
+.trace {
+  margin-top: 12px;
+}
+
+.trace > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.trace-entry {
+  margin-top: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.9rem;
+}
+
+.trace-action {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.trace-reason,
+.trace-instruct {
+  margin-top: 4px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.trace-entry details {
+  margin-top: 6px;
+}
+
+.trace-entry summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.trace-entry pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
 .error {
   color: #ff8a8a;
   margin-top: 12px;

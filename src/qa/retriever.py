@@ -1,47 +1,33 @@
+"""CLIP frame retrieval (open_clip) with a process-wide embedding cache.
+
+``ClipFrameRetriever`` is moved unchanged from the pre-package qa.py; it fills
+the role LanguageBind played in Symphony. New here: a path-keyed embedding
+cache so repeated tool calls over the same job's frames only pay the image
+encoding cost once, and an async entry point that runs the (blocking, GPU/MPS)
+work in a thread under the shared lock.
+"""
+
+import asyncio
 import logging
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import cast
 
 import open_clip
 import torch
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from PIL import Image
-from pydantic import BaseModel
 
-from timeline import Timeline
-
-load_dotenv()
+from qa.config import MAX_CACHED_EMBEDDINGS
 
 logger = logging.getLogger(__name__)
 
-MODEL = "gemini-2.5-flash"
-
-# Number of CLIP-retrieved frames sent to the VLM in a single batch.
-TOP_K_FRAMES = 10
-
-# Per-request timeout (ms), matching the pipeline client's (server.py) so a
-# hung Gemini call during /ask can't pin a thread-pool slot forever.
-GEMINI_REQUEST_TIMEOUT_MS = 120_000
-
-_CLIENT = None
 _RETRIEVER = None
 _RETRIEVER_LOCK = threading.Lock()
 
-
-def _load_client():
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = genai.Client(
-            http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS)
-        )
-    return _CLIENT
-
-
-class UseVlmDecision(BaseModel):
-    use_vlm: bool
+# abs frame path -> 1D L2-normalized embedding row (CPU). FIFO-evicted; guarded
+# by _RETRIEVER_LOCK together with the model itself.
+_EMBED_CACHE: OrderedDict[str, torch.Tensor] = OrderedDict()
 
 
 def _pick_device() -> torch.device:
@@ -117,7 +103,7 @@ class ClipFrameRetriever:
         self,
         image_features: torch.Tensor,
         text_features: torch.Tensor,
-        top_k: int = TOP_K_FRAMES,
+        top_k: int,
     ) -> list[tuple[int, float]]:
         """
         Cosine similarity (both inputs must already be L2-normalized) between
@@ -143,29 +129,6 @@ class ClipFrameRetriever:
         )
         return ranked
 
-    def retrieve(
-        self,
-        frame_paths: list[str],
-        query: str,
-        top_k: int = TOP_K_FRAMES,
-        batch_size: int = 32,
-    ) -> list[tuple[str, float]]:
-        """
-        End-to-end: embed all frames + the text query, return the top_k most
-        similar frames as (path, similarity) sorted descending.
-        """
-        logger.debug(
-            "retrieve: query=%r over %d candidate frames", query, len(frame_paths)
-        )
-        image_features = self.encode_images(frame_paths, batch_size)
-        text_features = self.encode_text([query])
-        ranked = self.similarity_top_k(image_features, text_features, top_k=top_k)
-        results = [(frame_paths[i], score) for i, score in ranked]
-        logger.debug("retrieve: selected %d frame(s):", len(results))
-        for path, score in results:
-            logger.debug("  %.4f  %s", score, path)
-        return results
-
 
 def _load_retriever() -> "ClipFrameRetriever":
     global _RETRIEVER
@@ -174,75 +137,53 @@ def _load_retriever() -> "ClipFrameRetriever":
     return _RETRIEVER
 
 
-def should_use_vlm(question: str) -> bool:
-    logger.debug("should_use_vlm: asking %s to route question=%r", MODEL, question)
-    client = _load_client()
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=(
-            "Decide if this video question requires repeated iterative VLM reasoning for complex, nuanced, or abstract questions (true), or "
-            "if CLIP based retrieval with one VLM pass will suffice, intended for scene/object/entity descriptions or any simple question. (false).\n\n"
-            f"Question:\n{question}"
-            "\nAlways return false"  # TODO: Fix this prompt
-        ),
-        config=types.GenerateContentConfig(
-            max_output_tokens=512,
-            response_mime_type="application/json",
-            response_schema=UseVlmDecision,
-        ),
-    )
-
-    if response.text is None:
-        raise RuntimeError(f"{MODEL} returned no text for should_use_vlm routing")
-    result = UseVlmDecision.model_validate_json(response.text)
-    logger.debug(
-        "should_use_vlm: routed to %s", "VLM + CLIP" if result.use_vlm else "CLIP only"
-    )
-    return result.use_vlm
-
-
-def _ask_vlm(question: str, frame_paths: list[str]) -> str:
-    logger.debug(
-        "_ask_vlm: sending %d frame(s) + question to %s", len(frame_paths), MODEL
-    )
-    contents = []
-    for path in frame_paths:
-        with open(path, "rb") as f:
-            image_bytes = f.read()
-        contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
-    contents.append(question)
-
-    client = _load_client()
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(max_output_tokens=1024),
-    )
-    if response.text is None:
-        raise RuntimeError(f"{MODEL} returned no text for _ask_vlm")
-    answer = response.text.strip()
-    logger.debug("_ask_vlm: answer (%d chars): %r", len(answer), answer)
-    return answer
-
-
-def answer_question(timeline: Timeline, question: str) -> str:
-    frame_paths = [frame.path for seg in timeline.segments for frame in seg.frames]
-    logger.info(
-        "answer_question: question=%r over %d total frames",
-        question,
-        len(frame_paths),
-    )
-    # CLIP inference runs on a shared, single retriever instance; serialize
-    # access so concurrent /ask requests don't submit into the same model at
-    # once (MPS in particular is not battle-tested under concurrent use).
-    with _RETRIEVER_LOCK:
-        top_frames = _load_retriever().retrieve(
-            frame_paths, question, top_k=TOP_K_FRAMES
+def _cached_image_features(
+    retriever: ClipFrameRetriever, frame_paths: list[str]
+) -> torch.Tensor:
+    """Image embeddings for frame_paths (in order), encoding only cache misses."""
+    uncached = [p for p in frame_paths if p not in _EMBED_CACHE]
+    if uncached:
+        feats = retriever.encode_images(uncached)
+        for path, row in zip(uncached, feats, strict=True):
+            _EMBED_CACHE[path] = row
+        while len(_EMBED_CACHE) > MAX_CACHED_EMBEDDINGS:
+            _EMBED_CACHE.popitem(last=False)
+        logger.debug(
+            "embed cache: %d new, %d total",
+            len(uncached),
+            len(_EMBED_CACHE),
         )
+    # A cache miss above may itself have been evicted if frame_paths exceeds
+    # the cache bound; fall back to re-encoding those rows individually.
+    rows = []
+    for path in frame_paths:
+        row = _EMBED_CACHE.get(path)
+        if row is None:
+            row = retriever.encode_images([path])[0]
+        rows.append(row)
+    return torch.stack(rows)
 
-    if should_use_vlm(question):
-        raise NotImplementedError("VLM reasoning path is not yet implemented")
 
-    answer = _ask_vlm(question, [path for path, _ in top_frames])
-    logger.info("answer_question: final answer=%r", answer)
-    return answer
+def _retrieve_cached(
+    frame_paths: list[str], cue: str, top_k: int
+) -> list[tuple[str, float]]:
+    if not frame_paths:
+        return []
+    # CLIP inference runs on a shared, single retriever instance; serialize
+    # access so concurrent tool calls don't submit into the same model at once
+    # (MPS in particular is not battle-tested under concurrent use).
+    with _RETRIEVER_LOCK:
+        retriever = _load_retriever()
+        image_features = _cached_image_features(retriever, frame_paths)
+        text_features = retriever.encode_text([cue])
+        ranked = retriever.similarity_top_k(image_features, text_features, top_k)
+    results = [(frame_paths[i], score) for i, score in ranked]
+    logger.debug("retrieve: cue=%r -> %d frame(s)", cue, len(results))
+    return results
+
+
+async def retrieve_top_k(
+    frame_paths: list[str], cue: str, top_k: int
+) -> list[tuple[str, float]]:
+    """Top-k frames for a text cue, as (path, similarity) sorted descending."""
+    return await asyncio.to_thread(_retrieve_cached, frame_paths, cue, top_k)

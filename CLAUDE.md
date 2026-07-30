@@ -115,9 +115,26 @@ The eight stages, each in its own module under `src/`:
    narration, both steps are skipped and no described video is written.
 
 Timelines are serialized as JSON via `Timeline.model_dump_json()`; `save_timeline()` /
-`load_timeline()` in `timeline.py` remain for that. `qa.py` lazily initializes its Gemini client
-and CLIP retriever on first use (not at import) and serializes CLIP access behind a lock, so the
-server can import it without an API key and concurrent `/ask` calls don't collide.
+`load_timeline()` in `timeline.py` remain for that.
+
+### Q&A (`src/qa/` package)
+
+`POST /api/jobs/{id}/ask` runs a multi-agent system (a port of Symphony's video-QA agents onto
+Gemini — see `qaPLAN.md` for the port's decisions). `qa/orchestrator.py::answer_question()` is the
+async entrypoint: a text-only **CoreAgent** planner loops (≤ `MAX_CYCLES` = 17 cycles), each cycle
+dispatching one worker agent — **LocalizeAgent** (grounds the question in time: CLIP
+`retrieve_tool` or the exhaustive `localize_tool`, which scores every 30s window with a Gemini
+vision call), **PerceptionAgent** (a ReAct loop over `frame_inspect_tool` /
+`interval_summary_tool` / `frame_associate_tool`), or **SubtitleAgent** (one pass over the
+timeline's dialogue transcript) — and appending the result to a shared `history` list that is
+re-serialized into every planner prompt. A `finish` decision passes through **ReflectionAgent**
+exactly once per question (fail-open critic); the response is `{status, answer, cycles, history}`
+and the frontend renders the history as a collapsible reasoning-trace panel. Tools resolve frames
+via `qa/frame_index.py` (built from each `Frame.time`) and retrieve with `qa/retriever.py`
+(open_clip behind a lock + a path-keyed embedding cache, so only a job's first tool call pays the
+encode cost). The Gemini client is the server's shared injected one (`_get_pipeline_client`), so
+the server still boots without an API key; models/thinking levels/top-k knobs live in
+`qa/config.py`, prompts in `qa/prompts.py`.
 
 ### Module import style
 
@@ -126,6 +143,11 @@ server can import it without an API key and concurrent `/ask` calls don't collid
 with `uvicorn --app-dir src` (and pytest uses `pythonpath = ["src"]`), both of which put `src/`
 on `sys.path`. Keep new modules flat in `src/` and use the same unqualified import style rather
 than introducing a package layout, unless deliberately migrating away from this.
+
+**Exception:** `src/qa/` is a package — the multi-agent Q&A system is too large for one module.
+It deliberately keeps the name `qa`, so `import qa` / `qa.answer_question` (and the monkeypatch
+target in `tests/test_server.py`) work exactly as before; inside the package, imports are
+package-absolute (`from qa.config import ...`).
 
 ### I/O layout
 

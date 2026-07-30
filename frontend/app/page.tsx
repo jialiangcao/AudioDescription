@@ -8,10 +8,12 @@ import {
   narrationUrl,
   uploadVideo,
   wsBase,
+  type AskResult,
   type Frame,
   type JobStatus,
   type PipelineEvent,
   type Segment,
+  type TraceEntry,
 } from "./lib/api";
 
 const STAGE_ORDER = [
@@ -80,7 +82,7 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
 
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState<string | null>(null);
+  const [answer, setAnswer] = useState<AskResult | null>(null);
   const [asking, setAsking] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -423,9 +425,45 @@ export default function Home() {
               {asking ? "Thinking…" : "Ask"}
             </button>
           </div>
-          {answer && <div className="answer">{answer}</div>}
+          {answer && (
+            <>
+              <div className="answer">
+                {answer.answer ??
+                  `The agents could not settle on an answer (status: ${answer.status}).`}
+              </div>
+              <details className="trace">
+                <summary>
+                  Reasoning trace — {answer.cycles}{" "}
+                  {answer.cycles === 1 ? "cycle" : "cycles"} ({answer.status})
+                </summary>
+                {answer.history.map((entry, i) => (
+                  <TraceCard key={i} entry={entry} />
+                ))}
+              </details>
+            </>
+          )}
         </div>
       )}
     </main>
+  );
+}
+
+/** One agent-trajectory step: the action/agent, why it ran, and its output. */
+function TraceCard({ entry }: { entry: TraceEntry }) {
+  const detail = entry.result ?? entry.answer ?? entry.comment;
+  return (
+    <div className="trace-entry">
+      <div className="trace-action">{entry.action}</div>
+      {entry.reason && <div className="trace-reason">{entry.reason}</div>}
+      {entry.instruct && (
+        <div className="trace-instruct">instruct: {entry.instruct}</div>
+      )}
+      {detail && (
+        <details>
+          <summary>output</summary>
+          <pre>{detail}</pre>
+        </details>
+      )}
+    </div>
   );
 }

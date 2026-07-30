@@ -190,7 +190,12 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
-    answer: str
+    """Mirror of qa.QAResult: the answer plus the agent trajectory behind it."""
+
+    answer: str | None
+    status: str
+    cycles: int
+    history: list[dict]
 
 
 @app.post("/api/jobs", status_code=202)
@@ -292,15 +297,15 @@ async def ask(job_id: str, body: AskRequest) -> AskResponse:
 
     logger.info("job %s: Q&A question=%r", job_id, body.question)
     try:
-        answer = await asyncio.to_thread(
-            qa.answer_question, job.timeline, body.question
+        result = await qa.answer_question(
+            job.timeline, body.question, _get_pipeline_client(app)
         )
     except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
         logger.exception("job %s: Q&A failed", job_id)
         raise HTTPException(
             status_code=500, detail=f"could not answer question: {exc}"
         ) from exc
-    return AskResponse(answer=answer)
+    return AskResponse(**result.model_dump())
 
 
 @app.websocket("/api/jobs/{job_id}/events")

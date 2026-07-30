@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -87,14 +88,45 @@ def single_shot_video(tmp_path_factory):
 
 
 class FakeGeminiResponse:
-    def __init__(self, text):
+    """Minimal stand-in for a genai response: `.text`, `.function_calls`, and
+    `.candidates[0].content` (what the QA agents append back into contents)."""
+
+    def __init__(self, text, function_calls=None):
         self.text = text
+        self.function_calls = function_calls
+        self.candidates = [
+            SimpleNamespace(content=SimpleNamespace(role="model", text=text))
+        ]
+
+
+class FakeFunctionCall:
+    """Shape-compatible with types.FunctionCall (`.name` / `.args`)."""
+
+    def __init__(self, name, args=None):
+        self.name = name
+        self.args = args or {}
 
 
 def _canned_response(config):
-    """Frame-analysis calls (config.response_schema set) get canned JSON matching
-    FrameAnalysis; narration calls (no schema) get a canned sentence."""
-    if getattr(config, "response_schema", None) is not None:
+    """Schema-aware canned output, dispatched on the response_schema's name.
+
+    Vision/frame-analysis calls get FrameAnalysis JSON; the QA agents' schemas
+    get a minimal valid instance; schemaless calls get a canned sentence."""
+    schema = getattr(config, "response_schema", None)
+    schema_name = getattr(schema, "__name__", "")
+    if schema_name == "CoreDecision":
+        return FakeGeminiResponse(
+            '{"reason": "enough information", "agent": "finish", '
+            '"answer": "a canned answer"}'
+        )
+    if schema_name == "ReflectionAssessment":
+        return FakeGeminiResponse('{"credible": true, "comment": null}')
+    if schema_name == "Judgement":
+        return FakeGeminiResponse(
+            '{"relevance_score": 1, "clip_caption": "an unrelated scene", '
+            '"reasoning": null}'
+        )
+    if schema is not None:
         return FakeGeminiResponse(
             '{"description": "a test scene", "entities": ["object"], '
             '"actions": ["an object moves"], "setting": "a test setting", '
@@ -103,40 +135,92 @@ def _canned_response(config):
     return FakeGeminiResponse("A quiet moment unfolds on screen.")
 
 
+def _snapshot(contents):
+    """Agents mutate their contents list between turns; copy it so each
+    recorded call keeps what was actually sent."""
+    return list(contents) if isinstance(contents, list) else contents
+
+
 class _FakeAsyncModels:
-    def __init__(self, calls):
-        self._calls = calls
+    def __init__(self, client):
+        self._client = client
 
     async def generate_content(self, model, contents, config=None):
-        self._calls.append((model, contents, config))
+        self._client.calls.append((model, _snapshot(contents), config))
+        if self._client.scripted:
+            return self._client.scripted.pop(0)
         return _canned_response(config)
 
 
 class _FakeAio:
-    def __init__(self, calls):
-        self.models = _FakeAsyncModels(calls)
+    def __init__(self, client):
+        self.models = _FakeAsyncModels(client)
 
 
 class FakeGeminiClient:
     """Stand-in for google.genai.Client that avoids real network calls.
 
-    Exposes both the sync ``.models.generate_content`` (used by qa.py) and the
-    async ``.aio.models.generate_content`` (used by vision_analysis.py).
+    Exposes both the sync ``.models.generate_content`` and the async
+    ``.aio.models.generate_content`` surfaces. ``queue()`` scripts responses
+    (consumed FIFO by either surface) ahead of the canned fallback.
     """
 
     def __init__(self):
         self.models = self
         self.calls = []
-        self.aio = _FakeAio(self.calls)
+        self.scripted = []
+        self.aio = _FakeAio(self)
+
+    def queue(self, *responses):
+        self.scripted.extend(responses)
+        return self
 
     def generate_content(self, model, contents, config=None):
-        self.calls.append((model, contents, config))
+        self.calls.append((model, _snapshot(contents), config))
+        if self.scripted:
+            return self.scripted.pop(0)
         return _canned_response(config)
 
 
 @pytest.fixture
 def fake_gemini_client():
     return FakeGeminiClient()
+
+
+@pytest.fixture(scope="session")
+def fake_frame_index(tmp_path_factory):
+    """A synthetic 100s FrameIndex: one frame every 2s (t=0,2,...,98), each
+    path backed by a tiny fake jpg (the vision tools read the bytes)."""
+    from qa.frame_index import FrameIndex
+
+    frames_dir = tmp_path_factory.mktemp("qa-frames")
+    entries = []
+    for t in range(0, 100, 2):
+        path = frames_dir / f"shot_{t:04d}.jpg"
+        path.write_bytes(b"fake-jpeg")
+        entries.append((float(t), str(path)))
+    return FrameIndex(entries=entries, duration_sec=100.0)
+
+
+@pytest.fixture
+def stub_retriever(monkeypatch):
+    """Replace CLIP retrieval with a deterministic ranking (input order,
+    descending fake scores). Returns the list of (paths, cue, top_k) calls."""
+    import qa.retriever
+    import qa.tools_perception
+
+    calls = []
+
+    async def _fake_retrieve_top_k(frame_paths, cue, top_k):
+        calls.append((list(frame_paths), cue, top_k))
+        k = min(top_k, len(frame_paths))
+        return [(frame_paths[i], 1.0 - i * 0.01) for i in range(k)]
+
+    monkeypatch.setattr(qa.retriever, "retrieve_top_k", _fake_retrieve_top_k)
+    monkeypatch.setattr(
+        qa.tools_perception.retriever, "retrieve_top_k", _fake_retrieve_top_k
+    )
+    return calls
 
 
 class FakeKokoroPipeline:

@@ -110,7 +110,17 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "JobStore", lambda: JobStore(root=tmp_path / "jobs"))
     monkeypatch.setattr(server, "run_pipeline", _fake_run_pipeline)
     monkeypatch.setattr(server, "_get_pipeline_client", lambda app: None)
-    monkeypatch.setattr(qa, "answer_question", lambda timeline, question: "blue")
+
+    async def _fake_answer_question(timeline, question, client):
+        return qa.QAResult(
+            status="completed",
+            answer="blue",
+            reason="Task finished successfully.",
+            cycles=2,
+            history=[{"action": "finish", "answer": "blue"}],
+        )
+
+    monkeypatch.setattr(qa, "answer_question", _fake_answer_question)
     with TestClient(server.app) as c:
         yield c
 
@@ -144,7 +154,11 @@ def test_upload_then_status_then_ask(client):
 
     answer = client.post(f"/api/jobs/{job_id}/ask", json={"question": "eye color?"})
     assert answer.status_code == 200
-    assert answer.json()["answer"] == "blue"
+    body = answer.json()
+    assert body["answer"] == "blue"
+    assert body["status"] == "completed"
+    assert body["cycles"] == 2
+    assert body["history"] == [{"action": "finish", "answer": "blue"}]
 
 
 def test_upload_rejects_unsupported_type(client):
