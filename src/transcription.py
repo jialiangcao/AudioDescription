@@ -1,7 +1,5 @@
 import logging
 
-from faster_whisper import WhisperModel
-
 logger = logging.getLogger(__name__)
 
 MODEL_SIZE = "small"
@@ -13,6 +11,11 @@ def _load_model():
     global _MODEL
     if _MODEL is None:
         logger.info("loading faster-whisper model %r (cpu/int8)", MODEL_SIZE)
+        # Imported here, not at module scope, so the slim worker image (which
+        # has no faster-whisper) can still import tasks.py and run the Gemini
+        # stages. Matches voice_activity's lazy load.
+        from faster_whisper import WhisperModel
+
         _MODEL = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
     return _MODEL
 

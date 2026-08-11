@@ -1,0 +1,25 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+
+# The frontend deploys to Vercel, not into these images.
+frontend
+
+# Stale artifacts from the removed CLI.
+src/in
+src/out
+
+# Never bake secrets into an image.
+.env
+.env.*
+!.env.example
+
+docs
+tests
+supabase
+docker-compose.yml
+*.md

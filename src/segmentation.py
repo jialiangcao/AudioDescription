@@ -1,10 +1,11 @@
 import logging
 
-import cv2
-from scenedetect import SceneManager, open_video
-from scenedetect.detectors import ContentDetector
-
 logger = logging.getLogger(__name__)
+
+# OpenCV and PySceneDetect are imported inside the functions that need them
+# rather than at module scope, so the slim worker image — which carries no
+# torch, no OpenCV and no scenedetect — can still import tasks.py and run the
+# Gemini-only stages. Only the media queue ever calls into this module.
 
 # Blob-key prefix for sampled frames; keys look like frames/shot_0000_00.jpg.
 FRAMES_PREFIX = "frames"
@@ -21,6 +22,8 @@ def probe_video(video_path):
     the duration can be recorded once, by the one stage that already has the
     source file on disk, and carried through the rest of the pipeline as data.
     """
+    import cv2
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -48,6 +51,9 @@ def detect_shots(video_path, threshold=27.0):
 
     Returns a list of (start_sec, end_sec) tuples covering the whole video.
     """
+    from scenedetect import SceneManager, open_video
+    from scenedetect.detectors import ContentDetector
+
     logger.debug("detect_shots: %s (threshold=%.1f)", video_path, threshold)
     video = open_video(video_path)
     scene_manager = SceneManager()
@@ -82,6 +88,8 @@ def extract_keyframes(video_path, shots, blobs, interval_sec=1.0):
     Uploading the written frames is the caller's job (it knows whether the run
     is local or backed by a bucket); the keys returned here are what to upload.
     """
+    import cv2
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     logger.debug(
