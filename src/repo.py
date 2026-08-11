@@ -342,6 +342,27 @@ async def get_qa_run(run_id: str, owner_id: str) -> dict | None:
     return result
 
 
+async def get_qa_run_unscoped(run_id: str) -> dict | None:
+    """A run without an owner check — for the worker that was handed its id.
+
+    The API only ever reaches runs through ``get_qa_run``, which is scoped; a
+    Celery task has already been authorized by whoever enqueued it and has no
+    user context of its own.
+    """
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "select id, job_id, owner_id, question, status from qa_runs where id = $1",
+        uuid.UUID(run_id),
+    )
+    if row is None:
+        return None
+    result = dict(row)
+    result["id"] = str(result["id"])
+    result["job_id"] = str(result["job_id"])
+    result["owner_id"] = str(result["owner_id"])
+    return result
+
+
 async def set_qa_run_status(run_id: str, status: str) -> None:
     pool = await get_pool()
     await pool.execute(

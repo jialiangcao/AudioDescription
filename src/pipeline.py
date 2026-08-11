@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 OnEvent = Callable[[dict], Awaitable[None]]
 
 
-def _shots_event(shots: list[dict]) -> dict:
+def shots_event(shots: list[dict]) -> dict:
     """The shot/frame skeleton, emitted before any frame has been described.
 
     Lets the client show every extracted frame with its timestamp immediately;
@@ -61,7 +61,7 @@ def _shots_event(shots: list[dict]) -> dict:
     }
 
 
-def _frame_event(shot: dict, frame: dict) -> dict:
+def frame_event(shot: dict, frame: dict) -> dict:
     return {
         "type": "frame",
         "shot_id": shot["id"],
@@ -113,7 +113,7 @@ async def run_pipeline(
     )
     # Publish the skeleton first so the client can show every extracted frame and
     # its timestamp while the descriptions are still being generated.
-    await on_event(_shots_event(shots))
+    await on_event(shots_event(shots))
     await on_event(
         {
             "type": "stage",
@@ -131,7 +131,7 @@ async def run_pipeline(
 
     async def _on_frame(shot: dict, frame: dict) -> None:
         logger.debug("shot %s frame %s described", shot["id"], frame["index"])
-        await on_event(_frame_event(shot, frame))
+        await on_event(frame_event(shot, frame))
 
     shots = await analyze_shots(shots, blobs, on_frame=_on_frame, client=client)
     logger.info("stage 2/8 vision done in %.1fs", time.monotonic() - t0)

@@ -19,6 +19,7 @@ source codec that mp4 can't hold.
 import logging
 import os
 import subprocess
+from pathlib import Path
 
 from audio_extract import has_audio_stream
 
@@ -100,7 +101,11 @@ def _ffmpeg_args(video_path, ad_track_path, out_path, source_has_audio, copy_vid
     return args
 
 
-def mux_described_video(video_path, ad_track_path, out_path=DESCRIBED_KEY) -> str:
+def mux_described_video(
+    video_path: str | Path,
+    ad_track_path: str | Path,
+    out_path: str | Path = DESCRIBED_KEY,
+) -> str:
     """Mux ``ad_track_path`` into ``video_path``, writing a described video.
 
     All three arguments are real local paths — ffmpeg needs files on disk, so
