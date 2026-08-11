@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+import gemini_limits
 from prompts import (
     FRAME_ANALYSIS_PROMPT,
     INLINE_OPTIMIZATION_PROMPT,
@@ -46,6 +47,20 @@ DEFAULT_CONCURRENCY = 4
 NARRATION_CONTEXT_SCENES = 6
 
 
+async def _generate(client, *, contents, config):
+    """One Gemini call: rate-limited globally, retried only when transient.
+
+    Every call in this module goes through here so the pipeline shares one
+    cross-worker rate limit with the Q&A agents, rather than each process
+    backing off against the quota on its own.
+    """
+    return await gemini_limits.with_retries(
+        lambda: client.aio.models.generate_content(
+            model=MODEL, contents=contents, config=config
+        )
+    )
+
+
 class FrameAnalysis(BaseModel):
     description: str
     entities: list[str]
@@ -73,8 +88,8 @@ async def analyze_frame(
         shot_duration=shot_duration,
         context=NO_CONTEXT,
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
             prompt,
@@ -231,8 +246,8 @@ async def generate_narration(client, segment, max_words, blobs, prior_scenes=Non
         )
     contents.append(prompt)
 
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -264,8 +279,8 @@ async def optimize_narration(client, combined_text, available_duration):
     prompt = INLINE_OPTIMIZATION_PROMPT.format(
         combined_text=combined_text, available_duration=available_duration
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -295,8 +310,8 @@ async def retry_optimize_narration(
         available_duration=available_duration,
         reduce_by=max(0.0, tts_duration - available_duration),
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
