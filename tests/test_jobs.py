@@ -18,7 +18,7 @@ def _store(tmp_path) -> JobStore:
 
 def _timeline() -> Timeline:
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=2.0,
         segments=[
             Segment(
@@ -29,7 +29,7 @@ def _timeline() -> Timeline:
                     Frame(
                         index=0,
                         time=0.0,
-                        path="shot_0000_00.jpg",
+                        key="frames/shot_0000_00.jpg",
                         visual=FrameAnalysis(
                             description="d",
                             entities=[],

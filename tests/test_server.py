@@ -12,7 +12,7 @@ from timeline import AudioAnalysis, Frame, FrameAnalysis, Segment, Timeline
 
 def _timeline() -> Timeline:
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=2.0,
         segments=[
             Segment(
@@ -23,7 +23,7 @@ def _timeline() -> Timeline:
                     Frame(
                         index=0,
                         time=0.0,
-                        path="shot_0000_00.jpg",
+                        key="frames/shot_0000_00.jpg",
                         visual=FrameAnalysis(
                             description="a test scene",
                             entities=[],
@@ -43,14 +43,9 @@ def _timeline() -> Timeline:
     )
 
 
-async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
-    frames = job_dir / "frames"
-    frames.mkdir(parents=True, exist_ok=True)
-    (frames / "shot_0000_00.jpg").write_bytes(b"fake-jpeg")
-
-    narration = job_dir / "narration"
-    narration.mkdir(parents=True, exist_ok=True)
-    (narration / "shot_0000.wav").write_bytes(b"fake-wav")
+async def _fake_run_pipeline(video_path, blobs, on_event, client=None):
+    blobs.path("frames/shot_0000_00.jpg").write_bytes(b"fake-jpeg")
+    blobs.path("narration/shot_0000.wav").write_bytes(b"fake-wav")
 
     await on_event({"type": "stage", "stage": "segmentation", "status": "start"})
     await on_event(
@@ -61,7 +56,9 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
                     "id": 0,
                     "start": 0.0,
                     "end": 2.0,
-                    "frames": [{"index": 0, "time": 0.0, "path": "shot_0000_00.jpg"}],
+                    "frames": [
+                        {"index": 0, "time": 0.0, "key": "frames/shot_0000_00.jpg"}
+                    ],
                 }
             ],
         }
@@ -72,7 +69,7 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
             "shot_id": 0,
             "index": 0,
             "time": 0.0,
-            "path": "shot_0000_00.jpg",
+            "key": "frames/shot_0000_00.jpg",
             "visual": {
                 "description": "a test scene",
                 "entities": [],
@@ -86,21 +83,21 @@ async def _fake_run_pipeline(video_path, job_dir, on_event, client=None):
     await on_event({"type": "timeline", "timeline": tl.model_dump()})
     await on_event({"type": "narration", "segment_id": 0, "text": "canned narration"})
     tl.segments[0].ad_narration = "canned narration"
-    tl.segments[0].ad_narration_audio = str(narration / "shot_0000.wav")
+    tl.segments[0].ad_narration_key = "narration/shot_0000.wav"
     tl.segments[0].ad_narration_duration_sec = 1.5
     tl.segments[0].ad_narration_overflow = False
     await on_event(
         {
             "type": "narration_audio",
             "segment_id": 0,
-            "audio": "shot_0000.wav",
+            "audio": "narration/shot_0000.wav",
             "duration_sec": 1.5,
             "overflow": False,
         }
     )
 
-    (job_dir / "described.mp4").write_bytes(b"fake-mp4")
-    tl.described_video = str(job_dir / "described.mp4")
+    blobs.path("described.mp4").write_bytes(b"fake-mp4")
+    tl.described_key = "described.mp4"
     await on_event({"type": "described_video", "video": "described.mp4"})
     return tl
 
@@ -111,7 +108,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "run_pipeline", _fake_run_pipeline)
     monkeypatch.setattr(server, "_get_pipeline_client", lambda app: None)
 
-    async def _fake_answer_question(timeline, question, client):
+    async def _fake_answer_question(timeline, question, client, blobs):
         return qa.QAResult(
             status="completed",
             answer="blue",

@@ -187,34 +187,65 @@ def fake_gemini_client():
     return FakeGeminiClient()
 
 
+@pytest.fixture
+def job_blobs(tmp_path):
+    """A local-only JobBlobs (no bucket) rooted at a fresh scratch dir.
+
+    Every stage writes through this, so a test's artifacts land under tmp_path
+    exactly as they would in a worker's scratch, and ``fetch`` is a plain
+    lookup rather than a download.
+    """
+    from blobs import JobBlobs
+
+    return JobBlobs("test-job", root=tmp_path / "job")
+
+
 @pytest.fixture(scope="session")
-def fake_frame_index(tmp_path_factory):
-    """A synthetic 100s FrameIndex: one frame every 2s (t=0,2,...,98), each
-    path backed by a tiny fake jpg (the vision tools read the bytes)."""
+def _qa_scratch(tmp_path_factory):
+    """Scratch dir shared by ``fake_frame_index`` and ``fake_blobs``."""
+    return tmp_path_factory.mktemp("qa-job")
+
+
+@pytest.fixture(scope="session")
+def fake_frame_index(_qa_scratch):
+    """A synthetic 100s FrameIndex: one frame every 2s (t=0,2,...,98).
+
+    Each entry is a blob key backed by a tiny fake jpg in the matching scratch
+    dir (the vision tools read the bytes through ``fake_blobs``).
+    """
     from qa.frame_index import FrameIndex
 
-    frames_dir = tmp_path_factory.mktemp("qa-frames")
     entries = []
     for t in range(0, 100, 2):
-        path = frames_dir / f"shot_{t:04d}.jpg"
+        key = f"frames/shot_{t:04d}.jpg"
+        path = _qa_scratch / key
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fake-jpeg")
-        entries.append((float(t), str(path)))
+        entries.append((float(t), key))
     return FrameIndex(entries=entries, duration_sec=100.0)
+
+
+@pytest.fixture(scope="session")
+def fake_blobs(_qa_scratch):
+    """A local-only JobBlobs rooted where ``fake_frame_index`` wrote its jpgs."""
+    from blobs import JobBlobs
+
+    return JobBlobs("qa-test-job", root=_qa_scratch)
 
 
 @pytest.fixture
 def stub_retriever(monkeypatch):
     """Replace CLIP retrieval with a deterministic ranking (input order,
-    descending fake scores). Returns the list of (paths, cue, top_k) calls."""
+    descending fake scores). Returns the list of (keys, cue, top_k) calls."""
     import qa.retriever
     import qa.tools_perception
 
     calls = []
 
-    async def _fake_retrieve_top_k(frame_paths, cue, top_k):
-        calls.append((list(frame_paths), cue, top_k))
-        k = min(top_k, len(frame_paths))
-        return [(frame_paths[i], 1.0 - i * 0.01) for i in range(k)]
+    async def _fake_retrieve_top_k(frame_keys, cue, top_k, blobs):
+        calls.append((list(frame_keys), cue, top_k))
+        k = min(top_k, len(frame_keys))
+        return [(frame_keys[i], 1.0 - i * 0.01) for i in range(k)]
 
     monkeypatch.setattr(qa.retriever, "retrieve_top_k", _fake_retrieve_top_k)
     monkeypatch.setattr(

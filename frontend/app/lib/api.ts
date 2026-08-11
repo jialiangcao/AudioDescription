@@ -7,17 +7,17 @@ export function wsBase(): string {
   return API_BASE.replace(/^http/, "ws");
 }
 
-/** Filename portion of a server-side keyframe path, for the frames endpoint. */
-export function basename(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
+/** Filename portion of a job-relative blob key, for the frames endpoint. */
+export function basename(key: string): string {
+  return key.split(/[\\/]/).pop() ?? key;
 }
 
-export function frameUrl(jobId: string, keyframePath: string): string {
-  return `${API_BASE}/api/jobs/${jobId}/frames/${basename(keyframePath)}`;
+export function frameUrl(jobId: string, frameKey: string): string {
+  return `${API_BASE}/api/jobs/${jobId}/frames/${basename(frameKey)}`;
 }
 
-export function narrationUrl(jobId: string, audioPath: string): string {
-  return `${API_BASE}/api/jobs/${jobId}/narration/${basename(audioPath)}`;
+export function narrationUrl(jobId: string, audioKey: string): string {
+  return `${API_BASE}/api/jobs/${jobId}/narration/${basename(audioKey)}`;
 }
 
 /** The muxed video: original picture + soundtrack with narration mixed in. */
@@ -39,8 +39,8 @@ export interface Frame {
   index: number;
   /** Absolute timestamp in the video, in seconds. */
   time: number;
-  /** Server-side path (or bare filename); pass through frameUrl(). */
-  path: string;
+  /** Job-relative blob key, e.g. "frames/shot_0000_00.jpg"; pass through frameUrl(). */
+  key: string;
   /** null until this frame's vision call lands. */
   visual: FrameAnalysis | null;
 }
@@ -62,8 +62,8 @@ export interface Segment {
   narratable_gap_sec: number | null;
   narration_start_sec: number | null;
   ad_narration: string | null;
-  // Server-side path to the synthesized narration WAV; pass through narrationUrl().
-  ad_narration_audio: string | null;
+  // Blob key of the synthesized narration WAV; pass through narrationUrl().
+  ad_narration_key: string | null;
   ad_narration_duration_sec: number | null;
   ad_narration_overflow: boolean | null;
 }
@@ -73,11 +73,11 @@ export interface Timeline {
   duration_sec: number;
   segments: Segment[];
   // Combined AD-only track: every narration clip placed at its play time.
-  ad_track_audio: string | null;
+  ad_track_key: string | null;
   ad_track_duration_sec: number | null;
-  // Server-side path to the video with the AD track mixed in; fetch it from
-  // describedVideoUrl() rather than using this path directly.
-  described_video: string | null;
+  // Blob key of the video with the AD track mixed in; fetch it from
+  // describedVideoUrl() rather than using this key directly.
+  described_key: string | null;
 }
 
 export type JobStatus =
@@ -106,7 +106,7 @@ export type PipelineEvent =
       shot_id: number;
       index: number;
       time: number;
-      path: string;
+      key: string;
       visual: FrameAnalysis | null;
     }
   | { type: "timeline"; timeline: Timeline }

@@ -13,16 +13,22 @@ from qa.subtitle_agent import SubtitleAgent
 from timeline import Frame, Segment, Timeline
 
 
+class _FakeBlobs:
+    """The scripted agents never touch storage, so a job id is all that's needed."""
+
+    job_id = "test-job"
+
+
 def _timeline():
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=10.0,
         segments=[
             Segment(
                 id=0,
                 start=0.0,
                 end=10.0,
-                frames=[Frame(index=0, time=0.0, path="f.jpg")],
+                frames=[Frame(index=0, time=0.0, key="frames/f.jpg")],
             )
         ],
     )
@@ -66,7 +72,8 @@ def _system(decisions, assessments=({"credible": True},), max_cycles=17):
         timeline=_timeline(),
         question="q?",
         client=FakeGeminiClient(),
-        frame_index=FrameIndex(entries=[(0.0, "f.jpg")], duration_sec=10.0),
+        blobs=_FakeBlobs(),
+        frame_index=FrameIndex(entries=[(0.0, "frames/f.jpg")], duration_sec=10.0),
         max_cycles=max_cycles,
     )
     fakes = SimpleNamespace(
@@ -189,7 +196,7 @@ async def test_answer_question_entrypoint(monkeypatch):
     # The public wrapper builds the FrameIndex and runs the system end-to-end;
     # with the canned client the planner immediately finishes and reflection
     # approves.
-    result = await answer_question(_timeline(), "q?", FakeGeminiClient())
+    result = await answer_question(_timeline(), "q?", FakeGeminiClient(), _FakeBlobs())
     assert result.status == "completed"
     assert result.answer == "a canned answer"
     assert result.history[-1] == {"action": "finish", "answer": "a canned answer"}

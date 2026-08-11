@@ -24,7 +24,8 @@ from audio_extract import has_audio_stream
 
 logger = logging.getLogger(__name__)
 
-DESCRIBED_FILENAME = "described.mp4"
+# Job-relative blob key of the muxed result; also its filename in scratch.
+DESCRIBED_KEY = "described.mp4"
 
 # Output audio format. 48kHz stereo AAC is the safe common denominator for
 # browser <video> playback; both inputs are resampled into it before mixing.
@@ -99,13 +100,20 @@ def _ffmpeg_args(video_path, ad_track_path, out_path, source_has_audio, copy_vid
     return args
 
 
-def mux_described_video(video_path, ad_track_path, out_path=DESCRIBED_FILENAME) -> str:
+def mux_described_video(video_path, ad_track_path, out_path=DESCRIBED_KEY) -> str:
     """Mux ``ad_track_path`` into ``video_path``, writing a described video.
 
-    Returns the output path. Raises ``subprocess.CalledProcessError`` if ffmpeg
-    fails even after falling back to re-encoding the video stream, and
-    ``FileNotFoundError`` if the AD track is missing.
+    All three arguments are real local paths — ffmpeg needs files on disk, so
+    resolving blob keys to scratch is the caller's job. Returns the output path.
+    Raises ``subprocess.CalledProcessError`` if ffmpeg fails even after falling
+    back to re-encoding the video stream, and ``FileNotFoundError`` if the AD
+    track is missing.
     """
+    video_path, ad_track_path, out_path = (
+        str(video_path),
+        str(ad_track_path),
+        str(out_path),
+    )
     if not os.path.isfile(ad_track_path):
         raise FileNotFoundError(f"AD track not found: {ad_track_path}")
 

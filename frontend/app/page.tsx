@@ -64,7 +64,7 @@ function mergeFrames(
     .map((frame) => ({
       index: frame.index ?? 0,
       time: frame.time ?? 0,
-      path: frame.path ?? "",
+      key: frame.key ?? "",
       visual: frame.visual ?? null,
     }));
 }
@@ -147,7 +147,7 @@ export default function Home() {
                 {
                   index: event.index,
                   time: event.time,
-                  path: event.path,
+                  key: event.key,
                   visual: event.visual,
                 },
               ]),
@@ -181,7 +181,7 @@ export default function Home() {
             ...prev,
             [event.segment_id]: {
               ...prev[event.segment_id],
-              ad_narration_audio: event.audio,
+              ad_narration_key: event.audio,
               ad_narration_duration_sec: event.duration_sec,
               ad_narration_overflow: event.overflow,
             },
@@ -325,10 +325,10 @@ export default function Home() {
           {(seg.frames ?? []).map((frame) => (
             <div className="frame" key={frame.index}>
               <div className="frame-thumb">
-                {jobId && frame.path ? (
+                {jobId && frame.key ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
-                    src={frameUrl(jobId, frame.path)}
+                    src={frameUrl(jobId, frame.key)}
                     alt={`shot ${seg.id} frame at ${frame.time}s`}
                   />
                 ) : (
@@ -383,11 +383,11 @@ export default function Home() {
           {seg.ad_narration ? (
             <div className="narration">🎙 {seg.ad_narration}</div>
           ) : null}
-          {seg.ad_narration_audio && jobId ? (
+          {seg.ad_narration_key && jobId ? (
             <div className="narration-audio">
               <audio
                 controls
-                src={narrationUrl(jobId, seg.ad_narration_audio)}
+                src={narrationUrl(jobId, seg.ad_narration_key)}
               />
               {seg.ad_narration_overflow ? (
                 <span

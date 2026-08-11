@@ -1,6 +1,5 @@
 import logging
 
-import cv2
 from pydantic import BaseModel, Field
 
 from voice_activity import longest_speech_free_span
@@ -23,14 +22,15 @@ class Frame(BaseModel):
     """One sampled frame of a shot, with its own independent analysis.
 
     ``index`` is the frame's position within its shot, ``time`` its absolute
-    timestamp in the video, and ``path`` the server-side jpg path (pass its
-    basename through the frames endpoint). ``visual`` is None until the frame's
-    Gemini call lands.
+    timestamp in the video, and ``key`` the job-relative blob key of the jpg
+    (e.g. ``frames/shot_0000_00.jpg``) — resolve it through ``blobs.JobBlobs``
+    to read the bytes, or presign it to hand the browser a URL. ``visual`` is
+    None until the frame's Gemini call lands.
     """
 
     index: int
     time: float
-    path: str
+    key: str
     visual: FrameAnalysis | None = None
 
 
@@ -66,25 +66,24 @@ class Segment(BaseModel):
     # Populated by vision_analysis.fill_narration_gaps for ad_eligible segments.
     ad_narration: str | None = None
     # Populated by tts.synthesize_narration for segments with ad_narration set.
-    # ad_narration_audio is the server-side path to the synthesized WAV clip.
-    ad_narration_audio: str | None = None
+    # ad_narration_key is the job-relative blob key of the synthesized WAV clip.
+    ad_narration_key: str | None = None
     ad_narration_duration_sec: float | None = None
     ad_narration_overflow: bool | None = None
 
 
 class Timeline(BaseModel):
-    video_id: str
+    # The job this timeline belongs to; blob keys below are relative to it.
+    job_id: str
     duration_sec: float
     segments: list[Segment]
     # Populated by ad_track.build_ad_track: a single WAV with every narration clip
-    # placed at the moment it would play alongside the video. ad_track_audio is
-    # the server-side path; pass its basename through the narration endpoint.
-    ad_track_audio: str | None = None
+    # placed at the moment it would play alongside the video.
+    ad_track_key: str | None = None
     ad_track_duration_sec: float | None = None
     # Populated by mux.mux_described_video: the source video with the AD track
-    # mixed into its soundtrack, i.e. the file to watch. Server-side path; the
-    # frontend fetches it from the job's described-video endpoint.
-    described_video: str | None = None
+    # mixed into its soundtrack, i.e. the file to watch.
+    described_key: str | None = None
 
 
 def _overlap_sec(a_start, a_end, b_start, b_end):
@@ -118,19 +117,17 @@ def _build_audio_analysis(start, end, speech_regions, transcript_segments):
     )
 
 
-def build_timeline(video_path, shots, speech_regions=None, transcript_segments=None):
+def build_timeline(
+    job_id, duration_sec, shots, speech_regions=None, transcript_segments=None
+):
+    """Merge shots, speech regions and transcript into a Timeline.
+
+    ``duration_sec`` comes from the segmentation stage's probe rather than being
+    re-read here, so this function needs no access to the source video — which
+    is what lets it run on a worker that never downloads it.
+    """
     speech_regions = speech_regions or []
     transcript_segments = transcript_segments or []
-
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    duration_sec = frame_count / fps if fps else 0.0
-    cap.release()
-    if not fps:
-        logger.warning(
-            "build_timeline: could not read fps for %s, duration=0", video_path
-        )
 
     segments = []
     for shot in shots:
@@ -157,13 +154,13 @@ def build_timeline(video_path, shots, speech_regions=None, transcript_segments=N
 
     eligible = sum(1 for s in segments if s.ad_eligible)
     logger.debug(
-        "build_timeline: %s -> %d segment(s), %d AD-eligible, duration=%.2fs",
-        video_path,
+        "build_timeline: job %s -> %d segment(s), %d AD-eligible, duration=%.2fs",
+        job_id,
         len(segments),
         eligible,
         duration_sec,
     )
-    return Timeline(video_id=video_path, duration_sec=duration_sec, segments=segments)
+    return Timeline(job_id=job_id, duration_sec=duration_sec, segments=segments)
 
 
 def save_timeline(timeline, out_path="timeline.json"):

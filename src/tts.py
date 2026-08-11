@@ -12,7 +12,6 @@ non-reentrant model instance.
 
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 
 import numpy as np
@@ -24,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 VOICE = "af_heart"
 SAMPLE_RATE = 24000
+
+# Blob-key prefix for synthesized clips; keys look like narration/shot_0000.wav.
+NARRATION_PREFIX = "narration"
 
 # If a synthesized clip overflows its gap, retry once at a higher speed, capped here
 # so the voice doesn't get distorted trying to fit an arbitrarily long line.
@@ -68,7 +70,11 @@ def _prepend_silence(audio, pad_sec):
     return np.concatenate([pad, audio])
 
 
-def _synthesize_segment(segment: Segment, gap_sec: float, out_dir: str) -> None:
+def narration_key(segment_id: int) -> str:
+    return f"{NARRATION_PREFIX}/shot_{segment_id:04d}.wav"
+
+
+def _synthesize_segment(segment: Segment, gap_sec: float, blobs) -> None:
     """Synthesize one segment's narration and write its WAV + timing metadata.
 
     Runs in a worker thread (blocking Kokoro inference + file write). The clip
@@ -100,10 +106,10 @@ def _synthesize_segment(segment: Segment, gap_sec: float, out_dir: str) -> None:
     audio = _prepend_silence(audio, pad_sec)
     duration = _duration_sec(audio)
 
-    path = os.path.join(out_dir, f"shot_{segment.id:04d}.wav")
-    sf.write(path, audio, SAMPLE_RATE)
+    key = narration_key(segment.id)
+    sf.write(str(blobs.path(key)), audio, SAMPLE_RATE)
 
-    segment.ad_narration_audio = path
+    segment.ad_narration_key = key
     segment.ad_narration_duration_sec = round(duration, 3)
     segment.ad_narration_overflow = duration > gap_sec
     if segment.ad_narration_overflow:
@@ -117,22 +123,22 @@ def _synthesize_segment(segment: Segment, gap_sec: float, out_dir: str) -> None:
 
 async def synthesize_narration(
     timeline: Timeline,
-    out_dir: str = "narration",
+    blobs,
     on_segment: Callable[[Segment], Awaitable[None]] | None = None,
     retry_optimize: Callable[[Segment, float, float], Awaitable[str]] | None = None,
 ) -> Timeline:
     """Synthesize narration audio for every segment that has ``ad_narration``.
 
-    ``on_segment`` (if given) is awaited with each segment as its clip finishes,
-    so callers can stream results. ``retry_optimize`` (if given) is awaited when a
-    synthesized clip still overruns its gap: it receives ``(segment, tts_duration,
-    gap_sec)`` and returns a shortened narration line, which is then re-synthesized
-    once (the paper's TTS-verified retry optimization). Unlike the Gemini stages
-    this runs one clip at a time (the Kokoro pipeline is a single shared model),
-    so segments complete in id order.
+    Clips are written into ``blobs``' scratch dir under ``narration/`` and
+    recorded on each segment as ``ad_narration_key``; uploading them is the
+    caller's job. ``on_segment`` (if given) is awaited with each segment as its
+    clip finishes, so callers can stream results. ``retry_optimize`` (if given)
+    is awaited when a synthesized clip still overruns its gap: it receives
+    ``(segment, tts_duration, gap_sec)`` and returns a shortened narration line,
+    which is then re-synthesized once (the paper's TTS-verified retry
+    optimization). Unlike the Gemini stages this runs one clip at a time (the
+    Kokoro pipeline is a single shared model), so segments complete in id order.
     """
-    os.makedirs(out_dir, exist_ok=True)
-
     synthesized = 0
     for segment in timeline.segments:
         if (
@@ -143,8 +149,12 @@ async def synthesize_narration(
             continue
 
         gap_sec = segment.narratable_gap_sec
-        logger.debug("synthesize_narration: segment %s -> %s", segment.id, out_dir)
-        await asyncio.to_thread(_synthesize_segment, segment, gap_sec, out_dir)
+        logger.debug(
+            "synthesize_narration: segment %s -> %s",
+            segment.id,
+            narration_key(segment.id),
+        )
+        await asyncio.to_thread(_synthesize_segment, segment, gap_sec, blobs)
 
         # Retry optimization: if the clip still overruns the gap, ask the model
         # for a shorter line using the measured duration, then re-synthesize once.
@@ -157,7 +167,7 @@ async def synthesize_narration(
                     segment.id,
                 )
                 segment.ad_narration = shorter
-                await asyncio.to_thread(_synthesize_segment, segment, gap_sec, out_dir)
+                await asyncio.to_thread(_synthesize_segment, segment, gap_sec, blobs)
 
         synthesized += 1
         if on_segment is not None:

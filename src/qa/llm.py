@@ -5,6 +5,7 @@ output via response_schema, `response.text is None` guard). Every call runs at
 temperature 0, matching Symphony.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -30,10 +31,14 @@ class ToolContext:
     Symphony injected `frame_path`/`video_duration` by inspecting each tool's
     code object for parameter names; passing an explicit context keeps the
     same property (the model never supplies these) without the introspection.
+
+    `blobs` resolves the frame index's blob keys to readable local files,
+    pulling them from object storage on first use.
     """
 
     client: object
     frame_index: FrameIndex
+    blobs: object
 
 
 async def generate_text(
@@ -67,18 +72,29 @@ async def generate_vision(
     *,
     system: str,
     user: str,
-    frame_paths: list[str],
+    frame_keys: list[str],
+    blobs,
     schema=None,
     max_output_tokens: int = VISION_MAX_OUTPUT_TOKENS,
 ) -> str:
-    """One Gemini call over a batch of frames + a prompt; returns the text."""
-    logger.debug("generate_vision: %d frame(s) -> %s", len(frame_paths), VISION_MODEL)
-    contents: list = []
-    for path in frame_paths:
-        with open(path, "rb") as f:
-            contents.append(
-                types.Part.from_bytes(data=f.read(), mime_type="image/jpeg")
-            )
+    """One Gemini call over a batch of frames + a prompt; returns the text.
+
+    Frames arrive as blob keys and are resolved through ``blobs`` (a fetch is a
+    no-op once the file is in scratch, which it is for every frame this job has
+    already touched).
+    """
+    logger.debug("generate_vision: %d frame(s) -> %s", len(frame_keys), VISION_MODEL)
+
+    def _read_all() -> list[bytes]:
+        # One thread hop for the whole batch rather than one per frame: these
+        # are cache hits in the common case, and hopping per frame would let
+        # batches of different sizes interleave for no benefit.
+        return [blobs.fetch(key).read_bytes() for key in frame_keys]
+
+    contents: list = [
+        types.Part.from_bytes(data=image, mime_type="image/jpeg")
+        for image in await asyncio.to_thread(_read_all)
+    ]
     contents.append(user)
 
     response = await client.aio.models.generate_content(

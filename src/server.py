@@ -29,6 +29,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 import qa
+from blobs import JobBlobs
 from jobs import (
     JOB_TTL_SEC,
     STATUS_DONE,
@@ -39,7 +40,7 @@ from jobs import (
     JobStore,
 )
 from log_config import configure_logging
-from mux import DESCRIBED_FILENAME
+from mux import DESCRIBED_KEY
 from pipeline import run_pipeline
 from timeline import Timeline
 
@@ -106,7 +107,8 @@ async def _process_job(app: FastAPI, job_id: str) -> None:
 
     try:
         client = _get_pipeline_client(app)
-        timeline = await run_pipeline(video, job.dir, on_event, client=client)
+        blobs = JobBlobs(job_id, root=job.dir)
+        timeline = await run_pipeline(video, blobs, on_event, client=client)
         store.set_timeline(job_id, timeline)
         store.set_status(job_id, STATUS_DONE)
         logger.info(
@@ -280,7 +282,7 @@ async def get_described_video(job_id: str) -> FileResponse:
     hence no traversal surface) — unlike the frames/narration endpoints.
     """
     job = _require_job(app, job_id)
-    target = job.dir / DESCRIBED_FILENAME
+    target = job.dir / DESCRIBED_KEY
     if not target.is_file():
         raise HTTPException(status_code=404, detail="described video not available")
     # FileResponse serves Range requests, which the browser needs in order to seek.
@@ -298,7 +300,10 @@ async def ask(job_id: str, body: AskRequest) -> AskResponse:
     logger.info("job %s: Q&A question=%r", job_id, body.question)
     try:
         result = await qa.answer_question(
-            job.timeline, body.question, _get_pipeline_client(app)
+            job.timeline,
+            body.question,
+            _get_pipeline_client(app),
+            JobBlobs(job_id, root=job.dir),
         )
     except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
         logger.exception("job %s: Q&A failed", job_id)

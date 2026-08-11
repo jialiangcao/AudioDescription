@@ -1,11 +1,46 @@
 import logging
-import os
 
 import cv2
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
 logger = logging.getLogger(__name__)
+
+# Blob-key prefix for sampled frames; keys look like frames/shot_0000_00.jpg.
+FRAMES_PREFIX = "frames"
+
+
+def frame_key(shot_id: int, index: int) -> str:
+    return f"{FRAMES_PREFIX}/shot_{shot_id:04d}_{index:02d}.jpg"
+
+
+def probe_video(video_path):
+    """Read fps / frame count / duration without decoding the video.
+
+    Split out from ``build_timeline`` (which used to open the video itself) so
+    the duration can be recorded once, by the one stage that already has the
+    source file on disk, and carried through the rest of the pipeline as data.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    # OpenCV reports -1 (not 0) for a file it can't decode, so a plain falsiness
+    # check lets it through and yields a *negative* duration downstream.
+    readable = fps > 0 and frame_count > 0
+    if not readable:
+        logger.warning(
+            "probe_video: could not read fps/frame count for %s (fps=%s, frames=%s), "
+            "duration=0",
+            video_path,
+            fps,
+            frame_count,
+        )
+    return {
+        "fps": fps if fps > 0 else 0.0,
+        "frame_count": frame_count if frame_count > 0 else 0.0,
+        "duration_sec": frame_count / fps if readable else 0.0,
+    }
 
 
 def detect_shots(video_path, threshold=27.0):
@@ -34,17 +69,19 @@ def detect_shots(video_path, threshold=27.0):
     return [(start.seconds, end.seconds) for start, end in scene_list]
 
 
-def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
+def extract_keyframes(video_path, shots, blobs, interval_sec=1.0):
     """Extract frames sampled every `interval_sec` within each shot.
 
-    Returns a list of shot dicts: `{id, start, end, frames}`, where `frames` is
-    every sampled frame in the shot in temporal order, each recorded as
-    `{index, time, path}` — `index` is its position within the shot and `time`
-    its absolute timestamp in the video. No frame is privileged: every one is
+    Frames are written into `blobs`' scratch dir and returned as shot dicts:
+    `{id, start, end, frames}`, where `frames` is every sampled frame in the
+    shot in temporal order, each recorded as `{index, time, key}` — `index` is
+    its position within the shot, `time` its absolute timestamp in the video,
+    and `key` its job-relative blob key. No frame is privileged: every one is
     described on its own by `vision_analysis.analyze_shots`.
-    """
-    os.makedirs(out_dir, exist_ok=True)
 
+    Uploading the written frames is the caller's job (it knows whether the run
+    is local or backed by a bucket); the keys returned here are what to upload.
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     logger.debug(
@@ -52,7 +89,7 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
         len(shots),
         fps,
         interval_sec,
-        out_dir,
+        blobs.root,
     )
 
     shot_records = []
@@ -73,9 +110,9 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
             if not ok:
                 continue
             index = len(frames)
-            path = os.path.join(out_dir, f"shot_{i:04d}_{index:02d}.jpg")
-            cv2.imwrite(path, frame)
-            frames.append({"index": index, "time": round(t, 2), "path": path})
+            key = frame_key(i, index)
+            cv2.imwrite(str(blobs.path(key)), frame)
+            frames.append({"index": index, "time": round(t, 2), "key": key})
 
         if not frames:
             logger.warning("extract_keyframes: shot %d yielded no readable frames", i)
@@ -99,6 +136,6 @@ def extract_keyframes(video_path, shots, out_dir="frames", interval_sec=2.0):
     return shot_records
 
 
-def segment_video(video_path, out_dir="frames", threshold=27.0):
+def segment_video(video_path, blobs, threshold=27.0):
     shots = detect_shots(video_path, threshold=threshold)
-    return extract_keyframes(video_path, shots, out_dir=out_dir)
+    return extract_keyframes(video_path, shots, blobs)

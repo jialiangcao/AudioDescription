@@ -49,6 +49,7 @@ class QASystem:
         timeline: Timeline,
         question: str,
         client,
+        blobs,
         frame_index: FrameIndex | None = None,
         max_cycles: int = MAX_CYCLES,
     ):
@@ -63,7 +64,7 @@ class QASystem:
         self.history: list[dict] = []
 
         frame_index = frame_index or FrameIndex.from_timeline(timeline)
-        ctx = ToolContext(client=client, frame_index=frame_index)
+        ctx = ToolContext(client=client, frame_index=frame_index, blobs=blobs)
         self.core_agent = CoreAgent(
             client, question=question, video_duration_sec=self.video_duration
         )
@@ -189,14 +190,14 @@ class QASystem:
         )
 
 
-async def answer_question(timeline: Timeline, question: str, client) -> QAResult:
+async def answer_question(timeline: Timeline, question: str, client, blobs) -> QAResult:
     """Answer a free-form question about a processed video's timeline."""
     logger.info(
         "answer_question: question=%r over %d segment(s)",
         question,
         len(timeline.segments),
     )
-    system = QASystem(timeline=timeline, question=question, client=client)
+    system = QASystem(timeline=timeline, question=question, client=client, blobs=blobs)
     result = await system.run()
     logger.info(
         "answer_question: status=%s cycles=%d answer=%r",
