@@ -597,9 +597,28 @@ def answer_question(self, run_id: str, job_id: str):
         await _emit(
             job_id, {"type": "qa_status", "run_id": run_id, "status": "running"}
         )
+
+        async def _on_step(node: str, records: list[dict]) -> None:
+            """Stream the reasoning trace as the graph produces it.
+
+            A run is up to 17 planner cycles, so this is the difference between
+            a trace panel that fills in live and one that appears all at once
+            several minutes later.
+            """
+            if records:
+                await _emit(
+                    job_id,
+                    {
+                        "type": "qa_trace",
+                        "run_id": run_id,
+                        "node": node,
+                        "records": records,
+                    },
+                )
+
         try:
             result = await qa.answer_question(
-                timeline, run["question"], _gemini_client(), blobs
+                timeline, run["question"], _gemini_client(), blobs, on_step=_on_step
             )
         except Exception as exc:  # noqa: BLE001 - recorded on the run, not raised
             logger.exception("qa run %s failed", run_id)

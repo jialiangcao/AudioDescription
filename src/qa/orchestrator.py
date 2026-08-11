@@ -1,4 +1,4 @@
-"""QASystem: the cycle loop over the shared history blackboard.
+"""QASystem: the cycle loop over the shared history blackboard, as a LangGraph.
 
 Port of Symphony's VideoUnderstandingSystem. Each cycle: the CoreAgent plans
 (one Gemini call), the chosen worker agent runs (its tool results come back as
@@ -6,14 +6,27 @@ text), and the record lands in `history`, which is re-fed to the planner. A
 `finish` decision passes through the ReflectionAgent exactly once per question
 (the `if_reflected` latch); afterwards any `finish` is accepted as-is.
 
-Two Symphony crash paths are fixed here (an unparseable planner decision, and
-worker agents returning None); everything else — record shapes, the latch, the
-verbatim not-credible nudge sentence — is kept as in the original.
+The control flow is a `StateGraph` rather than a `while` loop. What that buys is
+not the loop itself — it is that every transition is a named node with typed
+state, so a run can be streamed step by step to the browser (the worker
+publishes each node's output as a `qa_trace` event) and checkpointed. `history`
+maps onto a reducer-appended channel exactly as it was: nodes return only the
+records they add.
+
+The observable behaviour is unchanged and deliberately so: record shapes and
+their key order, the latch, the verbatim not-credible nudge sentence, and the
+two Symphony crash paths that were already fixed here (an unparseable planner
+decision, and worker agents returning None). tests/test_qa_orchestrator.py is
+the specification.
 """
 
 import logging
-from typing import Literal
+import operator
+from collections.abc import Awaitable, Callable
+from typing import Annotated, Literal, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 
 from qa.config import MAX_CYCLES
@@ -27,6 +40,9 @@ from qa.subtitle_agent import SubtitleAgent
 from timeline import Timeline
 
 logger = logging.getLogger(__name__)
+
+# Awaited with (node_name, records_appended) as each graph node completes.
+StepCallback = Callable[[str, list[dict]], Awaitable[None]]
 
 NOT_CREDIBLE_ACTION = (
     "Upon reflection, your current answer is not reliable. Please reconsider "
@@ -43,6 +59,23 @@ class QAResult(BaseModel):
     history: list[dict]
 
 
+class QAState(TypedDict):
+    """The blackboard every node reads and appends to.
+
+    ``history`` is the only accumulating channel: nodes return just their new
+    records and the reducer concatenates, which is what the loop used to do by
+    mutating one shared list.
+    """
+
+    history: Annotated[list[dict], operator.add]
+    cycle_count: int
+    if_reflected: bool
+    decision: dict | None
+    proposed_answer: str | None
+    final_answer: str | None
+    completed: bool
+
+
 class QASystem:
     def __init__(
         self,
@@ -56,12 +89,6 @@ class QASystem:
         self.question = question
         self.video_duration = timeline.duration_sec
         self.max_cycles = max_cycles
-
-        self.if_reflected = 0
-        self.cycle_count = 0
-        self.completed = False
-        self.final_answer: str | None = None
-        self.history: list[dict] = []
 
         frame_index = frame_index or FrameIndex.from_timeline(timeline)
         ctx = ToolContext(client=client, frame_index=frame_index, blobs=blobs)
@@ -80,125 +107,271 @@ class QASystem:
         )
         self.reflection_agent = ReflectionAgent(client, question=question)
 
-    async def run(self) -> QAResult:
-        while not self.completed and self.cycle_count < self.max_cycles:
-            self.cycle_count += 1
-            logger.info("=== Q&A cycle %d ===", self.cycle_count)
+    # -- nodes ---------------------------------------------------------------
 
-            core_decision = await self.core_agent.run(history=self.history)
-            if core_decision is None:
-                logger.warning(
-                    "cycle %d: CoreAgent output unparseable", self.cycle_count
-                )
-                self.history.append(
+    async def _plan(self, state: QAState) -> dict:
+        """One planner call. Records a parse failure rather than crashing."""
+        cycle = state["cycle_count"] + 1
+        logger.info("=== Q&A cycle %d ===", cycle)
+
+        decision = await self.core_agent.run(history=state["history"])
+        if decision is None:
+            logger.warning("cycle %d: CoreAgent output unparseable", cycle)
+            return {
+                "cycle_count": cycle,
+                "decision": None,
+                "history": [
                     {
                         "action": "parse_failure",
                         "result": "CoreAgent returned unparseable output.",
                     }
-                )
-                continue
-            logger.info("cycle %d: core decision: %s", self.cycle_count, core_decision)
+                ],
+            }
+        logger.info("cycle %d: core decision: %s", cycle, decision)
+        return {"cycle_count": cycle, "decision": decision}
 
-            agent_to_call = core_decision.get("agent")
+    def _worker_record(self, decision: dict, result) -> dict:
+        """The history entry for a worker call.
 
-            if agent_to_call == "PerceptionAgent":
-                result = await self.perception_agent.run(
-                    instruct=core_decision.get("instruct"),
-                    question=self.question,
-                    video_duration=self.video_duration,
-                )
-            elif agent_to_call == "SubtitleAgent":
-                result = await self.subtitle_agent.run()
-            elif agent_to_call == "LocalizeAgent":
-                result = await self.localize_agent.run()
-            elif agent_to_call == "finish":
-                proposed_answer = core_decision.get("answer")
-                self.history.append(
-                    {
-                        "action": agent_to_call,
-                        "reason": core_decision.get("reason"),
-                        "answer": proposed_answer,
-                    }
-                )
+        Key insertion order matters: history is serialized straight into the
+        planner's next prompt, so reordering these changes the model's input.
+        """
+        record: dict = {"action": decision.get("agent")}
+        if decision.get("instruct") is not None:
+            record["instruct"] = decision.get("instruct")
+        record["reason"] = decision.get("reason")
+        record["result"] = result
+        return record
 
-                # Reflection fires at most once per question; later finishes
-                # are accepted unconditionally (Symphony's if_reflected latch).
-                if not self.if_reflected:
-                    assessment = await self.reflection_agent.run(
-                        proposed_answer=proposed_answer, history=self.history
-                    )
-                    self.if_reflected = 1
-                else:
-                    assessment = {"credible": True}
+    async def _perception(self, state: QAState) -> dict:
+        decision = state["decision"] or {}
+        result = await self.perception_agent.run(
+            instruct=decision.get("instruct"),
+            question=self.question,
+            video_duration=self.video_duration,
+        )
+        logger.debug("cycle %d result: %s", state["cycle_count"], result)
+        return {"history": [self._worker_record(decision, result)]}
 
-                if assessment.get("credible"):
-                    logger.info("cycle %d: answer accepted", self.cycle_count)
-                    self.completed = True
-                    self.final_answer = proposed_answer
-                    self.history.append(
-                        {
-                            "action": "reflection",
-                            "assessment": "credible",
-                            "proposed_answer": proposed_answer,
-                        }
-                    )
-                    self.history.append(
-                        {"action": "finish", "answer": self.final_answer}
-                    )
-                    break
-                logger.info("cycle %d: answer rejected by reflection", self.cycle_count)
-                self.history.append(
-                    {
-                        "action": NOT_CREDIBLE_ACTION,
-                        "assessment": "not_credible",
-                        "comment": assessment.get("comment", "No comment provided."),
-                    }
-                )
-                continue
-            else:
-                logger.warning(
-                    "cycle %d: unknown agent requested: %r",
-                    self.cycle_count,
-                    agent_to_call,
-                )
-                self.history.append(
-                    {"action": "unknown_agent", "decision": core_decision}
-                )
-                continue
+    async def _subtitle(self, state: QAState) -> dict:
+        decision = state["decision"] or {}
+        result = await self.subtitle_agent.run()
+        logger.debug("cycle %d result: %s", state["cycle_count"], result)
+        return {"history": [self._worker_record(decision, result)]}
 
-            record: dict = {"action": agent_to_call}
-            if core_decision.get("instruct") is not None:
-                record["instruct"] = core_decision.get("instruct")
-            record["reason"] = core_decision.get("reason")
-            record["result"] = result
-            self.history.append(record)
-            logger.debug("cycle %d result: %s", self.cycle_count, result)
+    async def _localize(self, state: QAState) -> dict:
+        decision = state["decision"] or {}
+        result = await self.localize_agent.run()
+        logger.debug("cycle %d result: %s", state["cycle_count"], result)
+        return {"history": [self._worker_record(decision, result)]}
 
-        if self.completed:
-            return self._build_final_result("completed", "Task finished successfully.")
-        return self._build_final_result("failed", "Exceeded maximum cycles.")
+    async def _unknown_agent(self, state: QAState) -> dict:
+        decision = state["decision"] or {}
+        logger.warning(
+            "cycle %d: unknown agent requested: %r",
+            state["cycle_count"],
+            decision.get("agent"),
+        )
+        return {"history": [{"action": "unknown_agent", "decision": decision}]}
+
+    async def _finish(self, state: QAState) -> dict:
+        """A proposed answer, screened by reflection at most once per question."""
+        decision = state["decision"] or {}
+        proposed = decision.get("answer")
+        cycle = state["cycle_count"]
+
+        # The finish record lands *before* reflecting, so the critic sees it.
+        records: list[dict] = [
+            {
+                "action": "finish",
+                "reason": decision.get("reason"),
+                "answer": proposed,
+            }
+        ]
+
+        # Reflection fires at most once per question; later finishes are
+        # accepted unconditionally (Symphony's if_reflected latch).
+        if not state["if_reflected"]:
+            assessment = await self.reflection_agent.run(
+                proposed_answer=proposed,
+                history=state["history"] + records,
+            )
+        else:
+            assessment = {"credible": True}
+
+        if assessment.get("credible"):
+            logger.info("cycle %d: answer accepted", cycle)
+            records.append(
+                {
+                    "action": "reflection",
+                    "assessment": "credible",
+                    "proposed_answer": proposed,
+                }
+            )
+            records.append({"action": "finish", "answer": proposed})
+            return {
+                "history": records,
+                "if_reflected": True,
+                "completed": True,
+                "final_answer": proposed,
+                "proposed_answer": proposed,
+            }
+
+        logger.info("cycle %d: answer rejected by reflection", cycle)
+        records.append(
+            {
+                "action": NOT_CREDIBLE_ACTION,
+                "assessment": "not_credible",
+                "comment": assessment.get("comment", "No comment provided."),
+            }
+        )
+        return {"history": records, "if_reflected": True, "proposed_answer": proposed}
+
+    # -- routing -------------------------------------------------------------
+
+    def _route_from_plan(self, state: QAState) -> str:
+        if state["cycle_count"] >= self.max_cycles and state["decision"] is None:
+            return END
+        decision = state["decision"]
+        if decision is None:
+            return "plan"  # parse failure: already recorded, try again
+        agent = decision.get("agent")
+        if agent == "PerceptionAgent":
+            return "perception"
+        if agent == "SubtitleAgent":
+            return "subtitle"
+        if agent == "LocalizeAgent":
+            return "localize"
+        if agent == "finish":
+            return "finish"
+        return "unknown_agent"
+
+    def _route_after_step(self, state: QAState) -> str:
+        """Back to the planner unless the answer stuck or we ran out of cycles."""
+        if state["completed"]:
+            return END
+        if state["cycle_count"] >= self.max_cycles:
+            return END
+        return "plan"
+
+    def build_graph(self):
+        """Compile the graph.
+
+        Built per run rather than once at construction, so swapping an agent on
+        the instance (as the tests do) is picked up — the nodes are bound
+        methods that read ``self`` when they execute.
+        """
+        graph = StateGraph(QAState)
+        graph.add_node("plan", self._plan)
+        graph.add_node("perception", self._perception)
+        graph.add_node("subtitle", self._subtitle)
+        graph.add_node("localize", self._localize)
+        graph.add_node("unknown_agent", self._unknown_agent)
+        graph.add_node("finish", self._finish)
+
+        graph.set_entry_point("plan")
+        graph.add_conditional_edges(
+            "plan",
+            self._route_from_plan,
+            {
+                "plan": "plan",
+                "perception": "perception",
+                "subtitle": "subtitle",
+                "localize": "localize",
+                "finish": "finish",
+                "unknown_agent": "unknown_agent",
+                END: END,
+            },
+        )
+        for node in ("perception", "subtitle", "localize", "unknown_agent", "finish"):
+            graph.add_conditional_edges(
+                node, self._route_after_step, {"plan": "plan", END: END}
+            )
+        return graph.compile()
+
+    # -- entry point ---------------------------------------------------------
+
+    async def run(self, on_step: StepCallback | None = None) -> QAResult:
+        """Run the graph to completion.
+
+        ``on_step`` (if given) is awaited with each node's name and the records
+        it just appended, as they happen — which is the point of the graph:
+        the browser can watch the reasoning trace build instead of waiting
+        minutes for the finished answer.
+        """
+        initial: QAState = {
+            "history": [],
+            "cycle_count": 0,
+            "if_reflected": False,
+            "decision": None,
+            "proposed_answer": None,
+            "final_answer": None,
+            "completed": False,
+        }
+        # Each cycle is at most two super-steps; the real stopping condition is
+        # max_cycles, checked in the routers. This is only a backstop against a
+        # graph that somehow never terminates.
+        graph = self.build_graph()
+        config: RunnableConfig = {"recursion_limit": self.max_cycles * 4 + 10}
+
+        if on_step is None:
+            final = await graph.ainvoke(initial, config=config)
+        else:
+            final = await self._stream(graph, initial, config, on_step)
+
+        if final["completed"]:
+            return self._build_final_result(
+                final, "completed", "Task finished successfully."
+            )
+        return self._build_final_result(final, "failed", "Exceeded maximum cycles.")
+
+    async def _stream(self, graph, initial, config, on_step: StepCallback) -> QAState:
+        """Run the graph, reporting each node's updates, and rebuild the state.
+
+        ``stream_mode="updates"`` yields only what each node returned, so the
+        accumulated state has to be folded here — mirroring the reducers, which
+        for this graph means concatenating ``history`` and overwriting the rest.
+        """
+        state: QAState = dict(initial)  # type: ignore[assignment]
+        async for chunk in graph.astream(initial, config=config, stream_mode="updates"):
+            for node, update in chunk.items():
+                if not update:
+                    continue
+                for key, value in update.items():
+                    if key == "history":
+                        state["history"] = state["history"] + value
+                    else:
+                        state[key] = value  # type: ignore[literal-required]
+                await on_step(node, update.get("history", []))
+        return state
 
     def _build_final_result(
-        self, status: Literal["completed", "failed"], reason: str
+        self, state, status: Literal["completed", "failed"], reason: str
     ) -> QAResult:
         return QAResult(
             status=status,
-            answer=self.final_answer,
+            answer=state["final_answer"],
             reason=reason,
-            cycles=self.cycle_count,
-            history=self.history,
+            cycles=state["cycle_count"],
+            history=state["history"],
         )
 
 
-async def answer_question(timeline: Timeline, question: str, client, blobs) -> QAResult:
-    """Answer a free-form question about a processed video's timeline."""
+async def answer_question(
+    timeline: Timeline, question: str, client, blobs, on_step=None
+) -> QAResult:
+    """Answer a free-form question about a processed video's timeline.
+
+    ``on_step`` (optional) is awaited with each agent step as it completes, so
+    a caller can stream the reasoning trace rather than wait for the answer.
+    """
     logger.info(
         "answer_question: question=%r over %d segment(s)",
         question,
         len(timeline.segments),
     )
     system = QASystem(timeline=timeline, question=question, client=client, blobs=blobs)
-    result = await system.run()
+    result = await system.run(on_step=on_step)
     logger.info(
         "answer_question: status=%s cycles=%d answer=%r",
         result.status,
