@@ -1,9 +1,95 @@
+import os
 import shutil
 import subprocess
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+SQL_DIR = Path(__file__).parent / "sql"
+MIGRATIONS_DIR = Path(__file__).parents[1] / "supabase" / "migrations"
+
+
+@pytest.fixture(scope="session")
+def database_url():
+    """The Postgres to run repo tests against, or a skip if there isn't one.
+
+    `docker compose up -d postgres` provides it locally and CI runs it as a
+    service container; the rest of the suite needs no database, so tests that
+    do are skipped rather than failing on a developer's machine.
+    """
+    url = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not url:
+        pytest.skip("no TEST_DATABASE_URL/DATABASE_URL; start docker compose postgres")
+    return url
+
+
+@pytest.fixture(scope="session")
+def _migrated_db(database_url):
+    """Apply the auth shim + every migration once per session."""
+    import asyncio
+
+    import asyncpg
+
+    async def _apply():
+        conn = await asyncpg.connect(database_url)
+        try:
+            # A fresh start each session keeps a half-applied schema from an
+            # interrupted run out of the way.
+            await conn.execute(
+                "drop schema if exists public cascade; create schema public;"
+            )
+            await conn.execute((SQL_DIR / "auth_shim.sql").read_text())
+            for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                await conn.execute(path.read_text())
+        finally:
+            await conn.close()
+
+    asyncio.run(_apply())
+    return database_url
+
+
+@pytest.fixture
+async def db(_migrated_db, no_redis_publish, monkeypatch):
+    """A pool bound to the migrated test database, torn down per test."""
+    import db as db_module
+
+    monkeypatch.setenv("DATABASE_URL", _migrated_db)
+    await db_module.close_pool()
+    pool = await db_module.get_pool()
+    await pool.execute("truncate jobs, job_events, timelines, qa_runs cascade")
+    await pool.execute("truncate auth.users cascade")
+    yield pool
+    await db_module.close_pool()
+
+
+@pytest.fixture
+async def owner(db):
+    """An auth user id that jobs can be created under."""
+    owner_id = str(uuid.uuid4())
+    await db.execute("insert into auth.users (id) values ($1)", uuid.UUID(owner_id))
+    return owner_id
+
+
+@pytest.fixture
+def no_redis_publish(monkeypatch):
+    """Keep repo writes from needing a live Redis.
+
+    Fan-out is deliberately best-effort (see events.publish), so tests assert on
+    what landed in Postgres; the Redis path has its own tests, which exercise
+    the real function — hence this is pulled in by ``db`` rather than autouse.
+    """
+    import events
+
+    published = []
+
+    async def _capture(job_id, event):
+        published.append((job_id, event))
+
+    monkeypatch.setattr(events, "publish", _capture)
+    return published
 
 
 @pytest.fixture(scope="session")
