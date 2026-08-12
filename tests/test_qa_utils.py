@@ -1,7 +1,7 @@
 import pytest
 from conftest import FakeGeminiResponse
 
-from qa import utils
+import gemini_limits
 from qa.utils import (
     convert_hhmmss_to_seconds,
     convert_seconds_to_hhmmss,
@@ -55,25 +55,23 @@ async def test_fix_and_parse_json_gives_up(fake_gemini_client):
     assert await fix_and_parse_json("not json", fake_gemini_client) is None
 
 
-async def test_with_retries_retries_then_succeeds(monkeypatch):
-    monkeypatch.setattr(utils, "RETRY_BASE_DELAY_SEC", 0.0)
-    attempts = []
+async def test_with_retries_delegates_to_the_shared_policy(monkeypatch):
+    """The QA package keeps this entry point; the policy lives in one place.
 
-    async def flaky():
-        attempts.append(1)
-        if len(attempts) < 3:
-            raise RuntimeError("boom")
+    Agents and tools all call qa.utils.with_retries, but rate limiting has to
+    be shared across the pipeline stages and every worker, so the behaviour
+    itself is gemini_limits' (tested in tests/test_gemini_limits.py).
+    """
+    seen = {}
+
+    async def _fake(fn, attempts=None, tokens=1):
+        seen["attempts"] = attempts
+        return await fn()
+
+    monkeypatch.setattr(gemini_limits, "with_retries", _fake)
+
+    async def work():
         return "ok"
 
-    assert await with_retries(flaky) == "ok"
-    assert len(attempts) == 3
-
-
-async def test_with_retries_raises_after_exhaustion(monkeypatch):
-    monkeypatch.setattr(utils, "RETRY_BASE_DELAY_SEC", 0.0)
-
-    async def always_fails():
-        raise RuntimeError("boom")
-
-    with pytest.raises(RuntimeError):
-        await with_retries(always_fails, attempts=2)
+    assert await with_retries(work, attempts=7) == "ok"
+    assert seen["attempts"] == 7

@@ -1,0 +1,19 @@
+# The gemini-queue worker: per-frame vision and narration.
+#
+# Pure network I/O, so it runs the slim image at high thread concurrency and is
+# the pool to scale out when a backlog builds — it is the cheap one.
+
+app = "adesc-worker-gemini"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../docker/Dockerfile.slim"
+  build-target = "worker"
+
+[env]
+  ADESC_LOG_LEVEL = "INFO"
+
+# No [http_service]: this process only consumes the queue.
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"

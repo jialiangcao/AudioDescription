@@ -11,29 +11,28 @@ this is a pure post-processing/assembly step over files already on disk.
 """
 
 import logging
-import os
 
 import numpy as np
 import soundfile as sf
 
 from timeline import Timeline
-from tts import SAMPLE_RATE
+from tts import NARRATION_PREFIX, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
-AD_TRACK_FILENAME = "ad_track.wav"
+AD_TRACK_KEY = f"{NARRATION_PREFIX}/ad_track.wav"
 
 
-def _placed_clips(timeline: Timeline):
+def _placed_clips(timeline: Timeline, blobs):
     """Yield ``(offset_sec, mono_float32_samples)`` for each narration clip.
 
     Placement is the segment's ``narration_start_sec`` (start of its silent gap),
     falling back to the shot start if that wasn't recorded.
     """
     for seg in timeline.segments:
-        if not seg.ad_narration_audio:
+        if not seg.ad_narration_key:
             continue
-        clip, sr = sf.read(seg.ad_narration_audio, dtype="float32")
+        clip, sr = sf.read(blobs.fetch(seg.ad_narration_key), dtype="float32")
         if clip.ndim > 1:  # collapse any stereo to mono
             clip = clip.mean(axis=1)
         if sr != SAMPLE_RATE:
@@ -49,13 +48,13 @@ def _placed_clips(timeline: Timeline):
         yield float(offset), clip
 
 
-def build_ad_track(timeline: Timeline, out_dir: str) -> tuple[str, float] | None:
-    """Assemble the combined AD track for ``timeline`` and write it to ``out_dir``.
+def build_ad_track(timeline: Timeline, blobs) -> tuple[str, float] | None:
+    """Assemble the combined AD track for ``timeline`` into ``blobs``' scratch.
 
-    Returns ``(path, duration_sec)`` for the written WAV, or ``None`` if no
+    Returns ``(key, duration_sec)`` for the written WAV, or ``None`` if no
     segment had synthesized narration (nothing to assemble).
     """
-    clips = list(_placed_clips(timeline))
+    clips = list(_placed_clips(timeline, blobs))
     if not clips:
         logger.info("build_ad_track: no narration clips, skipping combined track")
         return None
@@ -82,11 +81,12 @@ def build_ad_track(timeline: Timeline, out_dir: str) -> tuple[str, float] | None
     if peak > 1.0:
         track /= peak
 
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, AD_TRACK_FILENAME)
-    sf.write(path, track, SAMPLE_RATE)
+    sf.write(str(blobs.path(AD_TRACK_KEY)), track, SAMPLE_RATE)
     duration = len(track) / SAMPLE_RATE
     logger.info(
-        "build_ad_track: wrote %s (%.1fs, %d clip(s))", path, duration, len(clips)
+        "build_ad_track: wrote %s (%.1fs, %d clip(s))",
+        AD_TRACK_KEY,
+        duration,
+        len(clips),
     )
-    return path, round(duration, 3)
+    return AD_TRACK_KEY, round(duration, 3)

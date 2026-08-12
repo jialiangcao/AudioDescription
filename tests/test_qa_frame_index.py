@@ -4,7 +4,7 @@ from timeline import Frame, Segment, Timeline
 
 def _timeline():
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=10.0,
         segments=[
             Segment(
@@ -12,8 +12,8 @@ def _timeline():
                 start=0.0,
                 end=4.0,
                 frames=[
-                    Frame(index=0, time=0.0, path="/f/shot_0000_00.jpg"),
-                    Frame(index=1, time=2.0, path="/f/shot_0000_01.jpg"),
+                    Frame(index=0, time=0.0, key="frames/shot_0000_00.jpg"),
+                    Frame(index=1, time=2.0, key="frames/shot_0000_01.jpg"),
                 ],
             ),
             Segment(
@@ -21,9 +21,9 @@ def _timeline():
                 start=4.0,
                 end=10.0,
                 frames=[
-                    Frame(index=0, time=4.0, path="/f/shot_0001_00.jpg"),
-                    Frame(index=1, time=6.0, path="/f/shot_0001_01.jpg"),
-                    Frame(index=2, time=8.0, path="/f/shot_0001_02.jpg"),
+                    Frame(index=0, time=4.0, key="frames/shot_0001_00.jpg"),
+                    Frame(index=1, time=6.0, key="frames/shot_0001_01.jpg"),
+                    Frame(index=2, time=8.0, key="frames/shot_0001_02.jpg"),
                 ],
             ),
         ],
@@ -34,22 +34,22 @@ def test_from_timeline_uses_frame_times_and_paths():
     index = FrameIndex.from_timeline(_timeline())
     assert index.duration_sec == 10.0
     assert index.entries == [
-        (0.0, "/f/shot_0000_00.jpg"),
-        (2.0, "/f/shot_0000_01.jpg"),
-        (4.0, "/f/shot_0001_00.jpg"),
-        (6.0, "/f/shot_0001_01.jpg"),
-        (8.0, "/f/shot_0001_02.jpg"),
+        (0.0, "frames/shot_0000_00.jpg"),
+        (2.0, "frames/shot_0000_01.jpg"),
+        (4.0, "frames/shot_0001_00.jpg"),
+        (6.0, "frames/shot_0001_01.jpg"),
+        (8.0, "frames/shot_0001_02.jpg"),
     ]
-    assert index.paths() == [path for _, path in index.entries]
-    assert index.timestamp_of("/f/shot_0001_01.jpg") == 6.0
+    assert index.keys() == [key for _, key in index.entries]
+    assert index.timestamp_of("frames/shot_0001_01.jpg") == 6.0
 
 
 def test_in_range_bounds_are_inclusive():
     index = FrameIndex.from_timeline(_timeline())
     assert index.in_range(2.0, 6.0) == [
-        (2.0, "/f/shot_0000_01.jpg"),
-        (4.0, "/f/shot_0001_00.jpg"),
-        (6.0, "/f/shot_0001_01.jpg"),
+        (2.0, "frames/shot_0000_01.jpg"),
+        (4.0, "frames/shot_0001_00.jpg"),
+        (6.0, "frames/shot_0001_01.jpg"),
     ]
     assert index.in_range(2.5, 3.5) == []
     assert index.in_range(-5.0, 100.0) == index.entries

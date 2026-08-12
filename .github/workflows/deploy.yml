@@ -1,0 +1,91 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      SUFFIX: -staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # Migrations run before the deploy: the new code expects the new schema.
+      # Every migration must therefore be backward compatible with the running
+      # version, since both are live during a rolling deploy.
+      - name: Apply database migrations
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - run: supabase db push --db-url "$STAGING_DATABASE_URL"
+        env:
+          STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+
+      # Workers first, API last: a worker that understands the new events can
+      # serve an old API, but not the other way round.
+      - name: Deploy media worker
+        run: flyctl deploy --config fly/worker-media.toml --app adesc-worker-media$SUFFIX --remote-only
+      - name: Deploy gemini worker
+        run: flyctl deploy --config fly/worker-gemini.toml --app adesc-worker-gemini$SUFFIX --remote-only
+      - name: Deploy beat
+        run: flyctl deploy --config fly/beat.toml --app adesc-beat$SUFFIX --remote-only
+      - name: Deploy API
+        run: flyctl deploy --config fly/api.toml --app adesc-api$SUFFIX --remote-only
+
+      - name: Smoke test
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS "https://adesc-api$SUFFIX.fly.dev/readyz"; then
+              echo "staging is ready"; exit 0
+            fi
+            sleep 5
+          done
+          echo "staging never became ready"; exit 1
+
+  production:
+    needs: staging
+    runs-on: ubuntu-latest
+    # Gated: this environment requires a manual approval in GitHub before the
+    # job starts.
+    environment: production
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - run: supabase db push --db-url "$PROD_DATABASE_URL"
+        env:
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+
+      - name: Deploy media worker
+        run: flyctl deploy --config fly/worker-media.toml --app adesc-worker-media --remote-only
+      - name: Deploy gemini worker
+        run: flyctl deploy --config fly/worker-gemini.toml --app adesc-worker-gemini --remote-only
+      - name: Deploy beat
+        run: flyctl deploy --config fly/beat.toml --app adesc-beat --remote-only
+      - name: Deploy API
+        run: flyctl deploy --config fly/api.toml --app adesc-api --remote-only
+
+      - name: Smoke test
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS "https://adesc-api.fly.dev/readyz"; then
+              echo "production is ready"; exit 0
+            fi
+            sleep 5
+          done
+          echo "production never became ready"; exit 1

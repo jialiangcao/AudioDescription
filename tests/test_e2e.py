@@ -6,7 +6,7 @@ from timeline import MIN_NARRATABLE_GAP_SEC
 
 
 async def test_run_pipeline_end_to_end(
-    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
+    job_blobs, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
 ):
     """Runs the real pipeline glue in pipeline.run_pipeline() over a small
     synthetic clip, stubbing only the external ML/API boundaries (Gemini,
@@ -17,22 +17,19 @@ async def test_run_pipeline_end_to_end(
     monkeypatch.setattr(pipeline, "detect_speech_regions", lambda audio_path: [])
     monkeypatch.setattr(pipeline, "transcribe", lambda audio_path, regions: [])
 
-    job_dir = tmp_path / "job"
-    job_dir.mkdir()
-
     events = []
 
     async def on_event(event):
         events.append(event)
 
     timeline = await run_pipeline(
-        synthetic_video, job_dir, on_event, client=fake_gemini_client
+        synthetic_video, job_blobs, on_event, client=fake_gemini_client
     )
 
-    assert timeline.video_id == synthetic_video
+    assert timeline.job_id == job_blobs.job_id
     assert timeline.duration_sec == pytest.approx(4.0, abs=0.2)
     assert len(timeline.segments) == 2
-    assert (job_dir / "audio.wav").exists()
+    assert job_blobs.path("audio.wav").exists()
 
     for segment in timeline.segments:
         # Every sampled frame is described on its own — there is no shot-level
@@ -57,15 +54,15 @@ async def test_run_pipeline_end_to_end(
         if segment.ad_eligible:
             assert segment.ad_narration == "A quiet moment unfolds on screen."
             # Narration was synthesized to a real WAV that fits the gap.
-            assert segment.ad_narration_audio is not None
-            assert (job_dir / "narration" / "shot_0000.wav").exists()
+            assert segment.ad_narration_key is not None
+            assert job_blobs.path("narration/shot_0000.wav").exists()
             # 1.0s of synthesized speech + a 0.22s leading pad (10% of the 2.2s
             # shot) = 1.22s, still within the gap.
             assert segment.ad_narration_duration_sec == 1.22
             assert segment.ad_narration_overflow is False
         else:
             assert segment.ad_narration is None
-            assert segment.ad_narration_audio is None
+            assert segment.ad_narration_key is None
 
     assert any(segment.ad_eligible for segment in timeline.segments)
 
@@ -95,42 +92,39 @@ async def test_run_pipeline_end_to_end(
     assert {(e["shot_id"], e["index"]) for e in frame_events} == {
         (seg.id, frame.index) for seg in timeline.segments for frame in seg.frames
     }
-    # Frame events reference bare filenames, ready for the frames endpoint.
+    # Frame events carry job-relative blob keys, resolvable through JobBlobs.
     for event in frame_events:
-        assert "/" not in event["path"]
-        assert (job_dir / "frames" / event["path"]).exists()
+        assert event["key"].startswith("frames/")
+        assert job_blobs.path(event["key"]).exists()
 
     assert any(e.get("type") == "timeline" for e in events)
     assert any(e.get("type") == "narration_audio" for e in events)
 
     # The combined AD-only track was assembled, streamed, and recorded on the
     # timeline, spanning the whole video.
-    assert timeline.ad_track_audio is not None
-    assert (job_dir / "narration" / "ad_track.wav").exists()
+    assert timeline.ad_track_key == "narration/ad_track.wav"
+    assert job_blobs.path("narration/ad_track.wav").exists()
     ad_track_events = [e for e in events if e.get("type") == "ad_track"]
     assert len(ad_track_events) == 1
-    assert ad_track_events[0]["audio"] == "ad_track.wav"
+    assert ad_track_events[0]["audio"] == "narration/ad_track.wav"
 
     # …and muxed into a playable video carrying both the original sound and the
     # narration, which is what the frontend serves up at the end.
-    assert timeline.described_video == str(job_dir / "described.mp4")
-    assert (job_dir / "described.mp4").exists()
+    assert timeline.described_key == "described.mp4"
+    assert job_blobs.path("described.mp4").exists()
     described_events = [e for e in events if e.get("type") == "described_video"]
     assert len(described_events) == 1
     assert described_events[0]["video"] == "described.mp4"
 
 
 async def test_run_pipeline_skips_mux_without_narration(
-    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
+    job_blobs, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
 ):
     """No narration clips means nothing to mix: the mux stage closes out without
     a described video rather than handing ffmpeg an empty track."""
     monkeypatch.setattr(pipeline, "detect_speech_regions", lambda audio_path: [])
     monkeypatch.setattr(pipeline, "transcribe", lambda audio_path, regions: [])
-    monkeypatch.setattr(pipeline, "build_ad_track", lambda timeline, out_dir: None)
-
-    job_dir = tmp_path / "job"
-    job_dir.mkdir()
+    monkeypatch.setattr(pipeline, "build_ad_track", lambda timeline, blobs: None)
 
     events = []
 
@@ -138,11 +132,11 @@ async def test_run_pipeline_skips_mux_without_narration(
         events.append(event)
 
     timeline = await run_pipeline(
-        synthetic_video, job_dir, on_event, client=fake_gemini_client
+        synthetic_video, job_blobs, on_event, client=fake_gemini_client
     )
 
-    assert timeline.described_video is None
-    assert not (job_dir / "described.mp4").exists()
+    assert timeline.described_key is None
+    assert not job_blobs.path("described.mp4").exists()
     assert not any(e.get("type") == "described_video" for e in events)
     mux_done = [
         e for e in events if e.get("stage") == "mux" and e.get("status") == "done"
@@ -151,7 +145,7 @@ async def test_run_pipeline_skips_mux_without_narration(
 
 
 async def test_run_pipeline_handles_video_without_audio(
-    tmp_path, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
+    job_blobs, monkeypatch, synthetic_video, fake_gemini_client, fake_kokoro
 ):
     """A source with no audio track skips VAD/transcription and still yields a
     full timeline (ad_eligible computed from shot duration alone)."""
@@ -168,16 +162,13 @@ async def test_run_pipeline_handles_video_without_audio(
     monkeypatch.setattr(pipeline, "detect_speech_regions", _should_not_run)
     monkeypatch.setattr(pipeline, "transcribe", _should_not_run)
 
-    job_dir = tmp_path / "job"
-    job_dir.mkdir()
-
     events = []
 
     async def on_event(event):
         events.append(event)
 
     timeline = await run_pipeline(
-        synthetic_video, job_dir, on_event, client=fake_gemini_client
+        synthetic_video, job_blobs, on_event, client=fake_gemini_client
     )
 
     assert len(timeline.segments) == 2

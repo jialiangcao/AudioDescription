@@ -1,0 +1,27 @@
+# The media-queue worker: ffmpeg, PySceneDetect, Silero, faster-whisper, Kokoro
+# — and the qa queue, whose CLIP retriever needs the torch only this image has.
+#
+# The expensive pool. Concurrency 1 per machine (the Kokoro pipeline is a single
+# shared, non-reentrant model, and these stages saturate a core each), so scale
+# by adding machines rather than raising concurrency.
+
+app = "adesc-worker-media"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../docker/Dockerfile.media"
+
+[env]
+  ADESC_LOG_LEVEL = "INFO"
+  ADESC_SCRATCH_ROOT = "/scratch"
+
+# Per-job working files: the source video, sampled frames, narration clips and
+# the muxed output. Everything durable is uploaded to R2, so this volume is a
+# cache — losing a machine costs a retry, not a job.
+[[mounts]]
+  source = "adesc_scratch"
+  destination = "/scratch"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "8gb"

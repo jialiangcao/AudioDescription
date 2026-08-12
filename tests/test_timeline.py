@@ -1,6 +1,5 @@
 import pytest
 
-import timeline as timeline_module
 from timeline import (
     AudioAnalysis,
     Frame,
@@ -47,27 +46,11 @@ def test_transcript_within_returns_none_when_no_overlap():
     assert _transcript_within(0.0, 2.0, segments) is None
 
 
-class _FakeCapture:
-    def __init__(self, fps, frame_count):
-        self._fps = fps
-        self._frame_count = frame_count
-
-    def get(self, prop):
-        if prop == timeline_module.cv2.CAP_PROP_FPS:
-            return self._fps
-        if prop == timeline_module.cv2.CAP_PROP_FRAME_COUNT:
-            return self._frame_count
-        return 0
-
-    def release(self):
-        pass
-
-
 def _frame(shot_id, index, time):
     return {
         "index": index,
         "time": time,
-        "path": f"shot_{shot_id:04d}_{index:02d}.jpg",
+        "key": f"frames/shot_{shot_id:04d}_{index:02d}.jpg",
         "visual": {
             "description": f"description {shot_id}.{index}",
             "entities": [],
@@ -87,18 +70,12 @@ def _shot(id_, start, end):
     }
 
 
-def test_build_timeline_computes_duration_and_ad_eligibility(monkeypatch):
-    monkeypatch.setattr(
-        timeline_module.cv2,
-        "VideoCapture",
-        lambda path: _FakeCapture(fps=10.0, frame_count=40),
-    )
-
+def test_build_timeline_computes_duration_and_ad_eligibility():
     shots = [_shot(0, 0.0, 2.2), _shot(1, 2.2, 4.0)]
     speech_regions = [(2.2, 3.0)]
     transcript_segments = [{"start": 2.2, "end": 3.0, "text": "hello"}]
 
-    tl = build_timeline("video.mp4", shots, speech_regions, transcript_segments)
+    tl = build_timeline("job-1", 4.0, shots, speech_regions, transcript_segments)
 
     assert tl.duration_sec == 4.0
     assert len(tl.segments) == 2
@@ -117,14 +94,8 @@ def test_build_timeline_computes_duration_and_ad_eligibility(monkeypatch):
     assert second.ad_eligible is False
 
 
-def test_build_timeline_carries_every_frame_with_its_own_analysis(monkeypatch):
-    monkeypatch.setattr(
-        timeline_module.cv2,
-        "VideoCapture",
-        lambda path: _FakeCapture(fps=10.0, frame_count=40),
-    )
-
-    tl = build_timeline("video.mp4", [_shot(0, 0.0, 2.0), _shot(1, 2.0, 4.0)])
+def test_build_timeline_carries_every_frame_with_its_own_analysis():
+    tl = build_timeline("job-1", 4.0, [_shot(0, 0.0, 2.0), _shot(1, 2.0, 4.0)])
 
     for segment in tl.segments:
         assert [f.index for f in segment.frames] == [0, 1]
@@ -137,20 +108,14 @@ def test_build_timeline_carries_every_frame_with_its_own_analysis(monkeypatch):
             assert frame.visual.actions == ["something happens"]
 
 
-def test_build_timeline_sizes_gap_to_longest_silence_not_total(monkeypatch):
-    monkeypatch.setattr(
-        timeline_module.cv2,
-        "VideoCapture",
-        lambda path: _FakeCapture(fps=10.0, frame_count=50),
-    )
-
+def test_build_timeline_sizes_gap_to_longest_silence_not_total():
     # A 5s shot chopped by three 0.6s speech bursts: total silence is 3.2s (which
     # would clear the 2.0s threshold under the old sum-of-silence calc), but no
     # single contiguous silent stretch exceeds 1.0s -> not narratable.
     shots = [_shot(0, 0.0, 5.0)]
     speech_regions = [(1.0, 1.6), (2.4, 3.0), (3.8, 4.4)]
 
-    tl = build_timeline("video.mp4", shots, speech_regions, transcript_segments=[])
+    tl = build_timeline("job-1", 5.0, shots, speech_regions, transcript_segments=[])
 
     seg = tl.segments[0]
     assert seg.narratable_gap_sec == pytest.approx(1.0)
@@ -159,7 +124,7 @@ def test_build_timeline_sizes_gap_to_longest_silence_not_total(monkeypatch):
 
 def test_save_and_load_timeline_roundtrip(tmp_path):
     tl = Timeline(
-        video_id="video.mp4",
+        job_id="job-1",
         duration_sec=4.0,
         segments=[
             Segment(
@@ -170,7 +135,7 @@ def test_save_and_load_timeline_roundtrip(tmp_path):
                     Frame(
                         index=0,
                         time=0.0,
-                        path="shot_0000_00.jpg",
+                        key="frames/shot_0000_00.jpg",
                         visual=FrameAnalysis(
                             description="d",
                             entities=[],

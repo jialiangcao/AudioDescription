@@ -1,0 +1,75 @@
+# Local development stack: the real services the deployed system uses, so dev
+# and prod differ only in endpoints and credentials.
+#
+#   postgres  stands in for Supabase's database (see supabase/migrations/).
+#             For auth work, run `supabase start` instead and point
+#             DATABASE_URL at it — this service is the lighter option for
+#             pipeline and worker development, and it is what CI uses.
+#   redis     Celery broker + result backend + the job-event pub/sub bus.
+#   minio     S3-compatible stand-in for Cloudflare R2.
+#
+#   docker compose up -d
+#   cp .env.example .env   # already points at these services
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: adesc
+      POSTGRES_PASSWORD: adesc
+      POSTGRES_DB: adesc
+    ports:
+      - "54322:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adesc -d adesc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Creates the bucket and allows the browser to PUT the source video straight
+  # to it, mirroring the CORS policy R2 needs in production.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/adesc &&
+      mc anonymous set none local/adesc &&
+      echo 'bucket adesc ready'
+      "
+
+volumes:
+  postgres-data:
+  minio-data:

@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+import gemini_limits
 from prompts import (
     FRAME_ANALYSIS_PROMPT,
     INLINE_OPTIMIZATION_PROMPT,
@@ -46,6 +47,20 @@ DEFAULT_CONCURRENCY = 4
 NARRATION_CONTEXT_SCENES = 6
 
 
+async def _generate(client, *, contents, config):
+    """One Gemini call: rate-limited globally, retried only when transient.
+
+    Every call in this module goes through here so the pipeline shares one
+    cross-worker rate limit with the Q&A agents, rather than each process
+    backing off against the quota on its own.
+    """
+    return await gemini_limits.with_retries(
+        lambda: client.aio.models.generate_content(
+            model=MODEL, contents=contents, config=config
+        )
+    )
+
+
 class FrameAnalysis(BaseModel):
     description: str
     entities: list[str]
@@ -73,8 +88,8 @@ async def analyze_frame(
         shot_duration=shot_duration,
         context=NO_CONTEXT,
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
             prompt,
@@ -98,17 +113,20 @@ async def analyze_frame(
 
 async def analyze_shots(
     shots,
+    blobs,
     on_frame: Callable[[dict, dict], Awaitable[None]] | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     client=None,
 ):
     """Attach a ``visual`` analysis to every sampled frame of every shot.
 
-    Each frame gets its own Gemini call, with up to ``concurrency`` in flight
-    across the whole video; ``on_frame`` (if given) is awaited with
-    ``(shot, frame)`` as each frame's analysis completes, so callers can stream
-    results. Completion order is neither shot nor frame order, so consumers must
-    key off ``shot["id"]`` and ``frame["index"]``.
+    Each frame's jpg is resolved from its blob key through ``blobs`` (fetched
+    from object storage only if it isn't already in scratch), then gets its own
+    Gemini call, with up to ``concurrency`` in flight across the whole video;
+    ``on_frame`` (if given) is awaited with ``(shot, frame)`` as each frame's
+    analysis completes, so callers can stream results. Completion order is
+    neither shot nor frame order, so consumers must key off ``shot["id"]`` and
+    ``frame["index"]``.
     """
     client = client or genai.Client()
     semaphore = asyncio.Semaphore(concurrency)
@@ -122,10 +140,11 @@ async def analyze_shots(
 
     async def _run(shot, frame):
         shot_duration = shot.get("end", 0.0) - shot.get("start", 0.0)
+        frame_path = await asyncio.to_thread(blobs.fetch, frame["key"])
         async with semaphore:
             frame["visual"] = await analyze_frame(
                 client,
-                frame["path"],
+                str(frame_path),
                 frame_time=frame["time"],
                 frame_index=frame["index"],
                 shot_duration=shot_duration,
@@ -197,7 +216,7 @@ def _prior_scenes_block(prior_scenes):
     return "\n".join(lines)
 
 
-async def generate_narration(client, segment, max_words, prior_scenes=None):
+async def generate_narration(client, segment, max_words, blobs, prior_scenes=None):
     """Write one AD narration line for ``segment``, from its whole frame sequence.
 
     Every frame sampled within the shot is attached as an image, in temporal
@@ -221,14 +240,14 @@ async def generate_narration(client, segment, max_words, prior_scenes=None):
     # list, so the model can line each image up with its description.
     contents = []
     for frame in segment.frames:
-        with open(frame.path, "rb") as f:
-            contents.append(
-                types.Part.from_bytes(data=f.read(), mime_type="image/jpeg")
-            )
+        frame_path = await asyncio.to_thread(blobs.fetch, frame.key)
+        contents.append(
+            types.Part.from_bytes(data=frame_path.read_bytes(), mime_type="image/jpeg")
+        )
     contents.append(prompt)
 
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -260,8 +279,8 @@ async def optimize_narration(client, combined_text, available_duration):
     prompt = INLINE_OPTIMIZATION_PROMPT.format(
         combined_text=combined_text, available_duration=available_duration
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -291,8 +310,8 @@ async def retry_optimize_narration(
         available_duration=available_duration,
         reduce_by=max(0.0, tts_duration - available_duration),
     )
-    response = await client.aio.models.generate_content(
-        model=MODEL,
+    response = await _generate(
+        client,
         contents=[prompt],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -313,6 +332,7 @@ def _estimated_speech_sec(text, words_per_sec):
 
 async def fill_narration_gaps(
     timeline: Timeline,
+    blobs,
     on_segment: Callable[[Segment], Awaitable[None]] | None = None,
     words_per_sec: float | None = None,
     client=None,
@@ -346,7 +366,7 @@ async def fill_narration_gaps(
                 gap,
                 len(prior),
             )
-            text = await generate_narration(client, segment, max_words, prior)
+            text = await generate_narration(client, segment, max_words, blobs, prior)
             # If the line's estimated spoken duration overruns the gap, condense
             # it with the inline optimization prompt so it fits the timing.
             if _estimated_speech_sec(text, words_per_sec) > gap:

@@ -161,14 +161,14 @@ def _parse_time_range(time_range, duration_sec: float) -> tuple[float, float]:
 
 async def retrieve_tool(cue: str, *, ctx: ToolContext) -> str:
     results = await retriever.retrieve_top_k(
-        ctx.frame_index.paths(), cue, RETRIEVE_TOP_K
+        ctx.frame_index.keys(), cue, RETRIEVE_TOP_K, ctx.blobs
     )
     if not results:
         return "Error: no frames available for this video."
     # Similarity order, not chronological — as in Symphony.
     frame_seconds = [
-        convert_seconds_to_hhmmss(ctx.frame_index.timestamp_of(path))
-        for path, _ in results
+        convert_seconds_to_hhmmss(ctx.frame_index.timestamp_of(key))
+        for key, _ in results
     ]
     logger.debug("retrieve_tool: cue=%r -> %s", cue, frame_seconds)
     return "The most similar time point:" + str(frame_seconds)
@@ -193,13 +193,13 @@ async def frame_inspect_tool(
         start, end, min(INSPECT_UNIFORM_MAX, int(end - start))
     )
     retrieved = await retriever.retrieve_top_k(
-        [path for _, path in candidates], cue, INSPECT_RETRIEVE_TOP_K
+        [key for _, key in candidates], cue, INSPECT_RETRIEVE_TOP_K, ctx.blobs
     )
-    selected = set(uniform) | {path for path, _ in retrieved}
-    frame_paths = sorted(selected, key=ctx.frame_index.timestamp_of)
+    selected = set(uniform) | {key for key, _ in retrieved}
+    frame_keys = sorted(selected, key=ctx.frame_index.timestamp_of)
     logger.debug(
         "frame_inspect_tool: %d frame(s) in [%s, %s]",
-        len(frame_paths),
+        len(frame_keys),
         time_range[0],
         time_range[1],
     )
@@ -209,7 +209,8 @@ async def frame_inspect_tool(
             ctx.client,
             system=VISION_TOOL_SYSTEM_PROMPT,
             user=FRAME_INSPECT_PROMPT.format(question=question),
-            frame_paths=frame_paths,
+            frame_keys=frame_keys,
+            blobs=ctx.blobs,
         )
     )
 
@@ -220,12 +221,12 @@ async def interval_summary_tool(question: str, time_range, *, ctx: ToolContext) 
     except ValueError as exc:
         return f"Error: {exc}"
 
-    frame_paths = ctx.frame_index.uniform_sample(start, end, SUMMARY_FRAME_COUNT)
-    if not frame_paths:
+    frame_keys = ctx.frame_index.uniform_sample(start, end, SUMMARY_FRAME_COUNT)
+    if not frame_keys:
         return f"Error: no frames available in the time range {time_range!r}."
     logger.debug(
         "interval_summary_tool: %d frame(s) in [%s, %s]",
-        len(frame_paths),
+        len(frame_keys),
         time_range[0],
         time_range[1],
     )
@@ -235,7 +236,8 @@ async def interval_summary_tool(question: str, time_range, *, ctx: ToolContext) 
             ctx.client,
             system=VISION_TOOL_SYSTEM_PROMPT,
             user=INTERVAL_SUMMARY_PROMPT.format(question=question),
-            frame_paths=frame_paths,
+            frame_keys=frame_keys,
+            blobs=ctx.blobs,
         )
     )
 
@@ -245,19 +247,19 @@ async def frame_associate_tool(
 ) -> str:
     if not cue:
         return "Error: cue must be a non-empty list of scene descriptions."
-    all_paths = ctx.frame_index.paths()
+    all_keys = ctx.frame_index.keys()
     selected: set[str] = set()
     for cue_item in cue:
         results = await retriever.retrieve_top_k(
-            all_paths, cue_item, ASSOCIATE_TOP_K_PER_CUE
+            all_keys, cue_item, ASSOCIATE_TOP_K_PER_CUE, ctx.blobs
         )
-        selected.update(path for path, _ in results)
+        selected.update(key for key, _ in results)
     if not selected:
         return "Error: no frames available for this video."
-    frame_paths = sorted(selected, key=ctx.frame_index.timestamp_of)
+    frame_keys = sorted(selected, key=ctx.frame_index.timestamp_of)
     logger.debug(
         "frame_associate_tool: %d frame(s) across %d cue(s)",
-        len(frame_paths),
+        len(frame_keys),
         len(cue),
     )
 
@@ -266,6 +268,7 @@ async def frame_associate_tool(
             ctx.client,
             system=VISION_TOOL_SYSTEM_PROMPT,
             user=FRAME_ASSOCIATE_PROMPT.format(question=question),
-            frame_paths=frame_paths,
+            frame_keys=frame_keys,
+            blobs=ctx.blobs,
         )
     )

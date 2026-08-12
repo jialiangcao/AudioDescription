@@ -68,17 +68,17 @@ async def test_core_falls_back_to_json_repair(fake_gemini_client):
 # --------------------------------------------------------------------------- #
 
 
-def _localize_agent(client, fake_frame_index):
+def _localize_agent(client, fake_frame_index, fake_blobs):
     return LocalizeAgent(
         client,
         question=QUESTION,
         video_duration_sec=100.0,
-        ctx=ToolContext(client=client, frame_index=fake_frame_index),
+        ctx=ToolContext(client=client, frame_index=fake_frame_index, blobs=fake_blobs),
     )
 
 
 async def test_localize_finish_returns_answer_string(
-    fake_gemini_client, fake_frame_index
+    fake_gemini_client, fake_frame_index, fake_blobs
 ):
     fake_gemini_client.queue(
         FakeGeminiResponse(
@@ -89,7 +89,7 @@ async def test_localize_finish_returns_answer_string(
             ],
         )
     )
-    agent = _localize_agent(fake_gemini_client, fake_frame_index)
+    agent = _localize_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     result = await agent.run()
 
     assert result == "00:01:00-00:02:00"
@@ -103,35 +103,37 @@ async def test_localize_finish_returns_answer_string(
 
 
 async def test_localize_dispatches_retrieve_tool(
-    fake_gemini_client, fake_frame_index, stub_retriever
+    fake_gemini_client, fake_frame_index, fake_blobs, stub_retriever
 ):
     fake_gemini_client.queue(
         FakeGeminiResponse(
             None, function_calls=[FakeFunctionCall("retrieve_tool", {"cue": "a car"})]
         )
     )
-    agent = _localize_agent(fake_gemini_client, fake_frame_index)
+    agent = _localize_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     result = await agent.run()
     assert result.startswith("The most similar time point:")
     assert stub_retriever[0][1] == "a car"
 
 
 async def test_localize_retries_until_tool_call_then_gives_up(
-    fake_gemini_client, fake_frame_index
+    fake_gemini_client, fake_frame_index, fake_blobs
 ):
     for _ in range(6):
         fake_gemini_client.queue(FakeGeminiResponse("no tools chosen"))
-    agent = _localize_agent(fake_gemini_client, fake_frame_index)
+    agent = _localize_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     result = await agent.run()
     assert result == "no tools chosen"
     assert len(fake_gemini_client.calls) == 6
 
 
-async def test_localize_unknown_tool_name(fake_gemini_client, fake_frame_index):
+async def test_localize_unknown_tool_name(
+    fake_gemini_client, fake_frame_index, fake_blobs
+):
     fake_gemini_client.queue(
         FakeGeminiResponse(None, function_calls=[FakeFunctionCall("bogus")])
     )
-    agent = _localize_agent(fake_gemini_client, fake_frame_index)
+    agent = _localize_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     assert await agent.run() == "Invalid function name: 'bogus'"
 
 
@@ -140,16 +142,16 @@ async def test_localize_unknown_tool_name(fake_gemini_client, fake_frame_index):
 # --------------------------------------------------------------------------- #
 
 
-def _perception_agent(client, fake_frame_index, max_iterations=6):
+def _perception_agent(client, fake_frame_index, fake_blobs, max_iterations=6):
     return PerceptionAgent(
         client,
-        ctx=ToolContext(client=client, frame_index=fake_frame_index),
+        ctx=ToolContext(client=client, frame_index=fake_frame_index, blobs=fake_blobs),
         max_iterations=max_iterations,
     )
 
 
 async def test_perception_tool_then_answer(
-    fake_gemini_client, fake_frame_index, stub_retriever
+    fake_gemini_client, fake_frame_index, fake_blobs, stub_retriever
 ):
     fake_gemini_client.queue(
         # Turn 1: the model requests one inspection (content text is None).
@@ -171,7 +173,7 @@ async def test_perception_tool_then_answer(
         # Turn 2: the model answers.
         FakeGeminiResponse("[answer] The car is red."),
     )
-    agent = _perception_agent(fake_gemini_client, fake_frame_index)
+    agent = _perception_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     result = await agent.run(
         instruct="check [00:00:10, 00:00:20] for (car color)",
         question=QUESTION,
@@ -193,7 +195,7 @@ async def test_perception_tool_then_answer(
 
 
 async def test_perception_force_answer_on_last_iteration(
-    fake_gemini_client, fake_frame_index, stub_retriever
+    fake_gemini_client, fake_frame_index, fake_blobs, stub_retriever
 ):
     inspect_call = FakeFunctionCall(
         "frame_inspect_tool",
@@ -205,7 +207,9 @@ async def test_perception_force_answer_on_last_iteration(
         FakeGeminiResponse("still looking", function_calls=[inspect_call]),
         FakeGeminiResponse("a scene"),  # tool vision call
     )
-    agent = _perception_agent(fake_gemini_client, fake_frame_index, max_iterations=2)
+    agent = _perception_agent(
+        fake_gemini_client, fake_frame_index, fake_blobs, max_iterations=2
+    )
     result = await agent.run(instruct="i", question=QUESTION, video_duration=100.0)
 
     # The forced-answer turn still tool-called; best-effort text comes back.
@@ -215,11 +219,11 @@ async def test_perception_force_answer_on_last_iteration(
 
 
 async def test_perception_returns_text_when_no_tools_requested(
-    fake_gemini_client, fake_frame_index
+    fake_gemini_client, fake_frame_index, fake_blobs
 ):
     for _ in range(6):
         fake_gemini_client.queue(FakeGeminiResponse("cannot determine"))
-    agent = _perception_agent(fake_gemini_client, fake_frame_index)
+    agent = _perception_agent(fake_gemini_client, fake_frame_index, fake_blobs)
     result = await agent.run(instruct="i", question=QUESTION, video_duration=100.0)
     assert result == "cannot determine"
     assert len(fake_gemini_client.calls) == 6  # inner retry exhausted
@@ -232,14 +236,14 @@ async def test_perception_returns_text_when_no_tools_requested(
 
 def _timeline_with_speech():
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=10.0,
         segments=[
             Segment(
                 id=0,
                 start=0.0,
                 end=2.0,
-                frames=[Frame(index=0, time=0.0, path="f.jpg")],
+                frames=[Frame(index=0, time=0.0, key="frames/f.jpg")],
                 audio=AudioAnalysis(
                     has_speech=True, transcript="hello there", silence_ratio=0.2
                 ),
@@ -248,7 +252,7 @@ def _timeline_with_speech():
                 id=1,
                 start=2.0,
                 end=5.0,
-                frames=[Frame(index=0, time=2.0, path="g.jpg")],
+                frames=[Frame(index=0, time=2.0, key="frames/g.jpg")],
                 audio=AudioAnalysis(
                     has_speech=False, transcript=None, silence_ratio=1.0
                 ),
@@ -257,7 +261,7 @@ def _timeline_with_speech():
                 id=2,
                 start=5.0,
                 end=8.0,
-                frames=[Frame(index=0, time=5.0, path="h.jpg")],
+                frames=[Frame(index=0, time=5.0, key="frames/h.jpg")],
                 audio=AudioAnalysis(
                     has_speech=True, transcript="general kenobi", silence_ratio=0.1
                 ),

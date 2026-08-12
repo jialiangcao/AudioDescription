@@ -1,0 +1,19 @@
+# Celery beat: the scheduler behind the stale-job reaper.
+#
+# Exactly one machine, always. Two would double every scheduled tick; zero
+# would let a crashed worker's job sit in "processing" indefinitely, since the
+# reaper is what notices an expired lease.
+
+app = "adesc-beat"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../docker/Dockerfile.media"
+  build-target = "beat"
+
+[env]
+  ADESC_LOG_LEVEL = "INFO"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

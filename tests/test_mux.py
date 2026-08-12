@@ -6,7 +6,7 @@ import pytest
 import soundfile as sf
 
 import mux
-from mux import DESCRIBED_FILENAME, LIMIT, NARRATION_GAIN, mux_described_video
+from mux import DESCRIBED_KEY, LIMIT, NARRATION_GAIN, mux_described_video
 
 # The AD track is written at Kokoro's rate by ad_track.py; the mux resamples it.
 AD_SAMPLE_RATE = 24000
@@ -140,13 +140,13 @@ def _duration(path):
 def test_missing_ad_track_raises(tmp_path, tone_video):
     with pytest.raises(FileNotFoundError):
         mux_described_video(
-            tone_video, str(tmp_path / "nope.wav"), str(tmp_path / DESCRIBED_FILENAME)
+            tone_video, str(tmp_path / "nope.wav"), str(tmp_path / DESCRIBED_KEY)
         )
 
 
 def test_narration_is_mixed_in_and_ducks_the_source(tmp_path, tone_video):
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 8.0)
-    out_path = tmp_path / "sub" / DESCRIBED_FILENAME
+    out_path = tmp_path / "sub" / DESCRIBED_KEY
 
     result = mux_described_video(tone_video, ad_track, str(out_path))
 
@@ -176,7 +176,7 @@ def test_narration_is_played_at_the_configured_gain(tmp_path, tone_video):
     while the duck depth stays keyed off the *ungained* track."""
     amplitude = 0.35
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 8.0, amplitude=amplitude)
-    out_path = tmp_path / DESCRIBED_FILENAME
+    out_path = tmp_path / DESCRIBED_KEY
 
     mux_described_video(tone_video, ad_track, str(out_path))
     audio, rate = _decode_audio(str(out_path), tmp_path / "decoded.wav")
@@ -191,7 +191,7 @@ def test_hot_narration_is_limited_rather_than_clipped(tmp_path, tone_video):
     """A loud line times NARRATION_GAIN would overshoot full scale; the limiter
     has to hold the mix in range instead of letting it clip."""
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 8.0, amplitude=0.9)
-    out_path = tmp_path / DESCRIBED_FILENAME
+    out_path = tmp_path / DESCRIBED_KEY
 
     mux_described_video(tone_video, ad_track, str(out_path))
     audio, _ = _decode_audio(str(out_path), tmp_path / "decoded.wav")
@@ -203,7 +203,7 @@ def test_short_ad_track_does_not_truncate_the_video(tmp_path, tone_video):
     """The AD track can be shorter than the video (e.g. if the last shot has no
     narration); the mux must still keep the full picture and soundtrack."""
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 3.0)
-    out_path = tmp_path / DESCRIBED_FILENAME
+    out_path = tmp_path / DESCRIBED_KEY
 
     mux_described_video(tone_video, ad_track, str(out_path))
 
@@ -217,7 +217,7 @@ def test_source_without_audio_gets_the_narration_as_its_soundtrack(
     tmp_path, silent_video
 ):
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 8.0)
-    out_path = tmp_path / DESCRIBED_FILENAME
+    out_path = tmp_path / DESCRIBED_KEY
 
     mux_described_video(silent_video, ad_track, str(out_path))
 
@@ -232,7 +232,7 @@ def test_falls_back_to_reencoding_when_stream_copy_fails(
     """Not every source codec can be stream-copied into mp4; the second attempt
     re-encodes the video instead of failing the job."""
     ad_track = _write_ad_track(tmp_path / "ad_track.wav", 8.0)
-    out_path = tmp_path / DESCRIBED_FILENAME
+    out_path = tmp_path / DESCRIBED_KEY
 
     real_run = subprocess.run
     attempts = []
@@ -266,4 +266,4 @@ def test_raises_when_reencode_also_fails(tmp_path, tone_video, monkeypatch):
     monkeypatch.setattr(mux.subprocess, "run", _fake_run)
 
     with pytest.raises(subprocess.CalledProcessError):
-        mux_described_video(tone_video, ad_track, str(tmp_path / DESCRIBED_FILENAME))
+        mux_described_video(tone_video, ad_track, str(tmp_path / DESCRIBED_KEY))

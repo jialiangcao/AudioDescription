@@ -5,6 +5,9 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
+# Job-relative blob key of the extracted 16kHz mono track.
+AUDIO_KEY = "audio.wav"
+
 
 class NoAudioStreamError(Exception):
     pass

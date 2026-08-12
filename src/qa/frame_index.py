@@ -19,33 +19,29 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class FrameIndex:
-    # (timestamp_sec, abs_path) sorted by timestamp.
+    # (timestamp_sec, blob_key) sorted by timestamp.
     entries: list[tuple[float, str]]
     duration_sec: float
-    _time_by_path: dict[str, float] = field(init=False, repr=False)
+    _time_by_key: dict[str, float] = field(init=False, repr=False)
 
     def __post_init__(self):
-        object.__setattr__(
-            self, "_time_by_path", {path: ts for ts, path in self.entries}
-        )
+        object.__setattr__(self, "_time_by_key", {key: ts for ts, key in self.entries})
 
     @classmethod
     def from_timeline(cls, timeline: Timeline) -> "FrameIndex":
         entries = sorted(
-            (frame.time, frame.path)
-            for seg in timeline.segments
-            for frame in seg.frames
+            (frame.time, frame.key) for seg in timeline.segments for frame in seg.frames
         )
         logger.debug(
             "FrameIndex: %d frame(s) over %.1fs", len(entries), timeline.duration_sec
         )
         return cls(entries=entries, duration_sec=timeline.duration_sec)
 
-    def paths(self) -> list[str]:
-        return [path for _, path in self.entries]
+    def keys(self) -> list[str]:
+        return [key for _, key in self.entries]
 
-    def timestamp_of(self, path: str) -> float:
-        return self._time_by_path[path]
+    def timestamp_of(self, key: str) -> float:
+        return self._time_by_key[key]
 
     def in_range(self, start_sec: float, end_sec: float) -> list[tuple[float, str]]:
         """Frames with start_sec <= timestamp <= end_sec, in temporal order."""
@@ -57,12 +53,12 @@ class FrameIndex:
     def windows(self, window_sec: float) -> list[tuple[float, float, list[str]]]:
         """Bucket every frame into a fixed [k*w, (k+1)*w) grid over the video.
 
-        Returns (window_start, window_end, frame_paths) per non-empty window,
+        Returns (window_start, window_end, frame_keys) per non-empty window,
         in temporal order — the replacement for Symphony's group_frames.
         """
         buckets: dict[int, list[str]] = {}
-        for ts, path in self.entries:
-            buckets.setdefault(int(ts // window_sec), []).append(path)
+        for ts, key in self.entries:
+            buckets.setdefault(int(ts // window_sec), []).append(key)
         return [
             (k * window_sec, (k + 1) * window_sec, buckets[k]) for k in sorted(buckets)
         ]
@@ -89,7 +85,7 @@ class FrameIndex:
                 and abs(timestamps[pos - 1] - instant) <= abs(timestamps[pos] - instant)
             ):
                 pos -= 1
-            path = candidates[pos][1]
-            if path not in picked:
-                picked.append(path)
+            key = candidates[pos][1]
+            if key not in picked:
+                picked.append(key)
         return picked
