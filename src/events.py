@@ -21,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 _client: redis.Redis | None = None
 
+# PING a pooled connection before reusing it if it has been idle this long.
+#
+# Managed Redis (and the Fly proxy in front of it) drops idle TCP connections,
+# and redis-py does not notice a dead pooled connection until it tries to use
+# it — so the next command after a quiet spell fails with a reset. This client
+# is idle between jobs, which for this deployment is most of the time.
+#
+# The failure it prevents is a quiet one: publish() swallows every exception,
+# and gemini_limits.acquire() falls open, so flapping connections would show up
+# as missing live progress and unthrottled Gemini calls rather than an error.
+HEALTH_CHECK_INTERVAL_SEC = 30
+
 
 def redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -30,7 +42,11 @@ def get_redis() -> redis.Redis:
     """The shared async Redis client, created on first use."""
     global _client
     if _client is None:
-        _client = redis.from_url(redis_url(), decode_responses=True)
+        _client = redis.from_url(
+            redis_url(),
+            decode_responses=True,
+            health_check_interval=HEALTH_CHECK_INTERVAL_SEC,
+        )
         logger.info("events: redis client ready")
     return _client
 
