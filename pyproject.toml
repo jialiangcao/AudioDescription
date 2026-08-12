@@ -43,6 +43,21 @@ media = [
     "torchvision>=0.28.0",
 ]
 
+# PyPI's torch wheels are the CUDA build: ~5GB of NVIDIA libraries that no
+# machine here can use, and enough on its own to push the media image past
+# Fly's 8GB uncompressed image limit, where it fails to unpack rather than
+# merely deploying slowly. The linux marker scopes this to the Docker images —
+# macOS wheels on PyPI are already CPU-only, so local dev is unaffected.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",

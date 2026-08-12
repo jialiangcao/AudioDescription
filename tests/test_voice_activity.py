@@ -1,6 +1,72 @@
+import sys
+
+import numpy as np
 import pytest
 
+import voice_activity
 from voice_activity import longest_speech_free_gap, longest_speech_free_span
+
+torch = pytest.importorskip("torch")
+sf = pytest.importorskip("soundfile")
+
+
+def _write_wav(path, rate=16000, seconds=0.5, channels=1):
+    t = np.linspace(0.0, seconds, int(rate * seconds), endpoint=False)
+    tone = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    data = np.stack([tone] * channels, axis=1) if channels > 1 else tone
+    sf.write(str(path), data, rate)
+    return tone
+
+
+def test_read_audio_returns_mono_float32_tensor(tmp_path):
+    wav_path = tmp_path / "audio.wav"
+    tone = _write_wav(wav_path)
+
+    out = voice_activity._read_audio(str(wav_path), 16000)
+
+    assert out.dtype == torch.float32
+    assert out.ndim == 1
+    assert len(out) == len(tone)
+    assert np.allclose(out.numpy(), tone, atol=1e-4)
+
+
+def test_read_audio_downmixes_stereo(tmp_path):
+    wav_path = tmp_path / "stereo.wav"
+    tone = _write_wav(wav_path, channels=2)
+
+    out = voice_activity._read_audio(str(wav_path), 16000)
+
+    assert out.ndim == 1
+    assert np.allclose(out.numpy(), tone, atol=1e-4)
+
+
+def test_read_audio_resamples_mismatched_rate(tmp_path):
+    wav_path = tmp_path / "audio8k.wav"
+    _write_wav(wav_path, rate=8000, seconds=1.0)
+
+    out = voice_activity._read_audio(str(wav_path), 16000)
+
+    assert len(out) == 16000
+
+
+def test_detect_speech_regions_does_not_import_torchaudio(tmp_path, monkeypatch):
+    # Regression: silero's read_audio pulls in torchaudio -> TorchCodec, which
+    # needs FFmpeg's shared libs and blew up at runtime in the media image.
+    wav_path = tmp_path / "audio.wav"
+    _write_wav(wav_path)
+
+    class _Poisoned:
+        def __getattr__(self, name):
+            raise RuntimeError("Could not load libtorchcodec")
+
+    monkeypatch.setitem(sys.modules, "torchaudio", _Poisoned())
+    monkeypatch.setattr(voice_activity, "_load_model", lambda: object())
+    monkeypatch.setattr(
+        "silero_vad.get_speech_timestamps",
+        lambda wav, model, **kw: [{"start": 0.0, "end": 0.25}],
+    )
+
+    assert voice_activity.detect_speech_regions(str(wav_path)) == [(0.0, 0.25)]
 
 
 def test_no_speech_returns_full_window():

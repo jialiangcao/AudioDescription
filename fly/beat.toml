@@ -8,7 +8,7 @@ app = "adesc-beat"
 primary_region = "iad"
 
 [build]
-  dockerfile = "../docker/Dockerfile.media"
+  dockerfile = "../docker/Dockerfile.slim"
   build-target = "beat"
 
 [env]

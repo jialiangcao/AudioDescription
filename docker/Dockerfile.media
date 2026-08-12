@@ -64,7 +64,6 @@ CMD ["celery", "--app", "celery_app", "worker", \
      "--queues", "media,qa", "--concurrency", "1", "--pool", "prefork", \
      "--loglevel", "INFO"]
 
-# --- beat ------------------------------------------------------------------
-# The scheduler for the stale-job reaper. Exactly one of these must run.
-FROM base AS beat
-CMD ["celery", "--app", "celery_app", "beat", "--loglevel", "INFO"]
+# Beat is NOT built here — it lives in Dockerfile.slim. It only schedules
+# tasks.reap_stale_jobs by name and never executes one, so none of this image's
+# weight buys it anything.

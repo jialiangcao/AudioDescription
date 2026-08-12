@@ -22,6 +22,12 @@ primary_region = "iad"
   source = "adesc_scratch"
   destination = "/scratch"
 
+# Shared, not performance: these stages are throughput work with no latency
+# target, so slower-but-cheaper cores only stretch a job's wall clock. The 8GB
+# stays — Whisper-small, Kokoro and CLIP are all resident at once. Nothing here
+# can idle down (no [http_service], so Fly's proxy autostop does not apply), so
+# this machine bills continuously; `fly scale count 0` between sessions is the
+# real lever.
 [[vm]]
-  size = "performance-2x"
+  size = "shared-cpu-4x"
   memory = "8gb"

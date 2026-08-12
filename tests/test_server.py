@@ -125,6 +125,37 @@ def test_readyz_reports_a_broken_dependency(client, monkeypatch):
     assert "redis" in response.json()["detail"]
 
 
+def test_readyz_fails_when_the_schema_is_missing(client, monkeypatch):
+    """A connected-but-schemaless database is not ready.
+
+    `select 1` answers perfectly well on a database whose migrations never ran,
+    so a readiness check built on it reported 200 while every real route 500'd
+    with UndefinedTableError — and the deploy's smoke test passed straight over
+    an empty production database. Readiness has to touch a table we own.
+    """
+    import asyncpg
+
+    class _SchemalessPool:
+        """Answers `select 1`, but knows no tables — a database missing its
+        migrations. Anything naming a relation raises, as Postgres would."""
+
+        async def fetchval(self, query, *args, **kwargs):
+            if "from" in query.lower():
+                raise asyncpg.exceptions.UndefinedTableError(
+                    'relation "jobs" does not exist'
+                )
+            return 1
+
+    async def _get_pool():
+        return _SchemalessPool()
+
+    monkeypatch.setattr(server.db, "get_pool", _get_pool)
+
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert "postgres" in response.json()["detail"]
+
+
 class _Unreachable:
     async def ping(self):
         raise ConnectionError("redis is down")

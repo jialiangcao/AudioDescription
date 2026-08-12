@@ -198,7 +198,11 @@ async def readyz() -> dict:
     checks = {}
     try:
         pool = await db.get_pool()
-        await pool.fetchval("select 1")
+        # Touch `jobs` rather than `select 1`: a connection to a database whose
+        # schema was never applied answers `select 1` perfectly well, so this
+        # returned 200 while every real route 500'd on UndefinedTableError, and
+        # the deploy's smoke test passed over a database with no tables in it.
+        await pool.fetchval("select 1 from jobs limit 1")
         checks["postgres"] = "ok"
     except Exception as exc:  # noqa: BLE001 - reported, not raised
         checks["postgres"] = f"error: {exc}"

@@ -58,3 +58,14 @@ ENV QUEUES=gemini
 CMD ["celery", "--app", "celery_app", "worker", \
      "--queues", "gemini", "--concurrency", "16", "--pool", "threads", \
      "--loglevel", "INFO"]
+
+# --- beat ------------------------------------------------------------------
+# The scheduler for the stale-job reaper. Exactly one of these must run.
+#
+# Beat belongs here, not in the media image: it only reads celery_app's
+# beat_schedule and enqueues tasks.reap_stale_jobs by name — it never executes
+# a task, so it needs none of torch, Kokoro, CLIP or ffmpeg. It was previously
+# built from Dockerfile.media, which pushed it past Fly's 8GB image limit and
+# left the machine unable to unpack.
+FROM base AS beat
+CMD ["celery", "--app", "celery_app", "beat", "--loglevel", "INFO"]

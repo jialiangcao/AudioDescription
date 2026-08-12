@@ -290,7 +290,9 @@ Two images, four Fly apps, one Vercel project.
   containers, frontend build, and both image builds.
 - `.github/workflows/deploy.yml` — on `main`: migrations, then workers, then the API (a worker that
   understands new events can serve an old API, not the reverse), then a `/readyz` smoke test.
-  Staging runs automatically; production is gated on a GitHub Environment approval.
+  There is no staging tier — it doubled the Fly bill, including a second always-on media
+  worker, to rehearse a deploy for a single-operator project. Production is gated on a
+  GitHub Environment approval.
 - The frontend deploys to Vercel. `NEXT_PUBLIC_API_BASE`, `NEXT_PUBLIC_SUPABASE_URL` and
   `NEXT_PUBLIC_SUPABASE_ANON_KEY` are **inlined at build time**, so they must be set per Vercel
   environment, not at runtime.

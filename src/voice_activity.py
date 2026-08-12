@@ -1,5 +1,7 @@
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 _MODEL = None
@@ -59,15 +61,48 @@ def longest_speech_free_gap(start, end, speech_regions):
     return longest_speech_free_span(start, end, speech_regions)[1]
 
 
+def _read_audio(audio_path, sample_rate):
+    """Load ``audio_path`` as a mono float32 torch tensor at ``sample_rate``.
+
+    Silero's own ``read_audio`` goes through ``torchaudio.load``, which on recent
+    torchaudio delegates to TorchCodec and needs FFmpeg's *shared libraries* at a
+    version TorchCodec was built against — a second, stricter dependency than the
+    ``ffmpeg`` binary the media image installs, and one that fails at runtime
+    inside the VAD stage. We already produce this file ourselves (16kHz mono WAV,
+    see ``audio_extract.py``), so libsndfile reads it directly and the whole
+    torchaudio/TorchCodec path drops out.
+    """
+    import soundfile as sf
+    import torch
+
+    data, file_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
+    if file_rate != sample_rate:
+        # Defensive only: extract_audio already writes at sample_rate.
+        logger.warning(
+            "resampling %s from %dHz to %dHz for VAD",
+            audio_path,
+            file_rate,
+            sample_rate,
+        )
+        n_out = int(round(len(mono) * sample_rate / file_rate))
+        mono = np.interp(
+            np.linspace(0.0, len(mono), num=n_out, endpoint=False),
+            np.arange(len(mono)),
+            mono,
+        ).astype(np.float32)
+    return torch.from_numpy(np.ascontiguousarray(mono))
+
+
 def detect_speech_regions(audio_path, threshold=0.5, sample_rate=16000):
     """Run Silero VAD over audio_path.
 
     Returns a sorted list of non-overlapping (start_sec, end_sec) speech regions.
     """
-    from silero_vad import get_speech_timestamps, read_audio
+    from silero_vad import get_speech_timestamps
 
     model = _load_model()
-    wav = read_audio(audio_path, sampling_rate=sample_rate)
+    wav = _read_audio(audio_path, sample_rate)
     timestamps = get_speech_timestamps(
         wav, model, threshold=threshold, sampling_rate=sample_rate, return_seconds=True
     )
