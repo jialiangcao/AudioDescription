@@ -80,15 +80,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="adesc", lifespan=lifespan)
 
+
+def _allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(
-            ","
-        )
-        if origin.strip()
-    ],
+    allow_origins=_allowed_origins(),
+    # Vercel gives every preview deploy a generated hostname, so they cannot be
+    # enumerated in ALLOWED_ORIGINS. Set ALLOWED_ORIGIN_REGEX to match them —
+    # e.g. ^https://adesc-[a-z0-9-]+\.vercel\.app$ — and leave it unset in
+    # production, where the origin list is known and should stay exact.
+    allow_origin_regex=os.environ.get("ALLOWED_ORIGIN_REGEX") or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

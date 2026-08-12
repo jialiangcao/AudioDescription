@@ -48,8 +48,14 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
             onSubmit={async (e) => {
               e.preventDefault();
               setError(null);
+              // Send the link back to whichever deployment the user is on.
+              // Without this, Supabase uses the project's single Site URL, so
+              // signing in from a preview deploy would land on production.
               const { error: signInError } =
-                await supabase().auth.signInWithOtp({ email });
+                await supabase().auth.signInWithOtp({
+                  email,
+                  options: { emailRedirectTo: window.location.origin },
+                });
               if (signInError) setError(signInError.message);
               else setSent(true);
             }}

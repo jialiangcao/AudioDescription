@@ -100,7 +100,34 @@ uv run pytest          # tests (needs the Postgres from docker compose)
 
 Create two projects: `adesc-prod` and `adesc-staging`.
 
-For each, collect:
+**Creation form:**
+
+| Field | Value | Why |
+|---|---|---|
+| Name | `adesc-prod` / `adesc-staging` | |
+| Database password | generate, save it | It's embedded in `DATABASE_URL`; you cannot read it back later. |
+| Region | **East US (North Virginia)** | Match your Fly `primary_region` (`iad` in `fly/*.toml`). Every request the API makes is a round trip; cross-region adds latency to all of them. |
+| Postgres version | default | Nothing in the migrations needs a specific one. |
+| Plan | Free is fine to start | Free projects **pause after 7 days idle** — fine for staging, not for production. |
+
+**After creation:**
+
+*Authentication → Sign In / Providers*
+- Enable **Email**. Leave "Confirm email" on — the magic-link flow satisfies it.
+- Password sign-in can be disabled; the frontend only calls `signInWithOtp`.
+
+*Authentication → URL Configuration*
+- **Site URL**: your Vercel production URL, e.g. `https://adesc.vercel.app`.
+- **Redirect URLs**: add `http://localhost:3000/**` and, if you want sign-in to
+  work on preview deploys, a wildcard for them —
+  `https://adesc-*-<your-team>.vercel.app/**`. The frontend passes
+  `emailRedirectTo: window.location.origin`, so the link returns to whichever
+  deployment you signed in from; each of those origins has to be allowlisted.
+
+*Nothing else needs changing.* The migrations create their own tables, RLS
+policies and the `pgcrypto` extension, and `auth.users` already exists.
+
+For each project, collect:
 
 - **Connection string** — the *session pooler* URI (port 5432), not the
   transaction pooler. asyncpg uses prepared statements, which the transaction
@@ -114,9 +141,6 @@ For each, collect:
 
   `src/auth.py` supports both and prefers the secret when present. New projects
   are asymmetric; prefer the JWKS path.
-
-Enable email sign-in (the frontend uses magic links). Add your Vercel URLs to
-the project's allowed redirect URLs.
 
 Apply migrations:
 
@@ -242,6 +266,7 @@ Repeat with staging values for the `-staging` apps.
 | `SUPABASE_URL` | API | JWKS verification. |
 | `SUPABASE_JWT_SECRET` | API | Only for legacy symmetric projects; omit otherwise. |
 | `ALLOWED_ORIGINS` | API | Comma-separated CORS list. Must include your Vercel domain. |
+| `ALLOWED_ORIGIN_REGEX` | API (staging only) | Vercel preview deploys get generated hostnames that can't be listed. Set e.g. `^https://adesc-[a-z0-9-]+\.vercel\.app$` on staging; leave **unset** in production, where the origin list is known and should stay exact. |
 | `GEMINI_RPM` | workers | Global requests/minute across *all* workers. Default 1000 is a guess — set it from your tier. |
 | `ADESC_LOG_LEVEL` | all | Default `INFO`; `DEBUG` emits one line per sampled frame. |
 | `ADESC_DEV_USER_ID` | — | **Never set this in a deployed environment.** It disables auth entirely. |
@@ -262,16 +287,33 @@ prod.
 
 ### Vercel
 
-These are inlined at **build time**, so they are set per environment and a
-change needs a redeploy:
+**Project settings** (Import Git Repository → configure):
 
-| Variable | Production | Preview |
+| Setting | Value | Why |
+|---|---|---|
+| Framework Preset | **Next.js** | Detected automatically once the root directory is right. |
+| **Root Directory** | **`frontend`** | The repo is a monorepo; without this the build fails immediately. Leave "Include files outside the root directory" **off** — the frontend needs nothing from `src/`. |
+| Build Command | default (`next build`) | |
+| Install Command | default (`npm install`) | |
+| Output Directory | default | Next.js manages its own. |
+| Node.js Version | **20.x or 22.x** | |
+
+**Environment variables.** All three are `NEXT_PUBLIC_*`, so they are **inlined
+at build time** — changing one requires a redeploy, not just a restart. Set them
+for each environment separately:
+
+| Variable | Production | Preview + Development |
 |---|---|---|
 | `NEXT_PUBLIC_API_BASE` | `https://adesc-api.fly.dev` | `https://adesc-api-staging.fly.dev` |
 | `NEXT_PUBLIC_SUPABASE_URL` | prod project URL | staging project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | prod anon key | staging anon key |
 
-Set the project root to `frontend/`.
+The anon key is designed to be public — it is shipped to the browser and RLS is
+what actually protects the data. The **service role key is not used anywhere in
+this app**; never put it in a `NEXT_PUBLIC_` variable.
+
+Once you know your production domain, feed it back into two places: the API's
+`ALLOWED_ORIGINS` and Supabase's Site URL.
 
 ---
 

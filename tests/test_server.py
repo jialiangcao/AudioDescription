@@ -567,3 +567,18 @@ async def test_media_urls_are_scoped_to_the_owner(client, db):
     )
 
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# CORS
+# --------------------------------------------------------------------------- #
+
+
+def test_allowed_origins_parses_a_comma_separated_list(monkeypatch):
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://a.example , https://b.example ,, ")
+    assert server._allowed_origins() == ["https://a.example", "https://b.example"]
+
+
+def test_allowed_origins_defaults_to_local_dev(monkeypatch):
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    assert server._allowed_origins() == ["http://localhost:3000"]
