@@ -51,7 +51,7 @@ async def _judge_window(
     ctx: ToolContext,
     semaphore: asyncio.Semaphore,
     window_start: float,
-    frame_paths: list[str],
+    frame_keys: list[str],
     question: str,
 ) -> dict | None:
     """Score one window; None on failure (the window is then skipped)."""
@@ -67,7 +67,8 @@ async def _judge_window(
                     ctx.client,
                     system=JUDGEMENT_SYSTEM_PROMPT,
                     user=prompt,
-                    frame_paths=frame_paths,
+                    frame_keys=frame_keys,
+                    blobs=ctx.blobs,
                     schema=Judgement,
                 )
             )
@@ -95,8 +96,8 @@ async def localize_tool(question: str, *, ctx: ToolContext) -> str:
     semaphore = asyncio.Semaphore(LOCALIZE_CONCURRENCY)
     results = await asyncio.gather(
         *(
-            _judge_window(ctx, semaphore, window_start, frame_paths, question)
-            for window_start, _, frame_paths in windows
+            _judge_window(ctx, semaphore, window_start, frame_keys, question)
+            for window_start, _, frame_keys in windows
         )
     )
 

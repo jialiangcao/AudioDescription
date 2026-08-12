@@ -392,3 +392,14 @@ button:disabled {
   color: #ff8a8a;
   margin-top: 12px;
 }
+
+/* Signed-in user + sign-out, above the app. */
+.auth-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}

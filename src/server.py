@@ -1,46 +1,39 @@
 """FastAPI backend for the adesc web app.
 
-Serves the drag-and-drop upload → live audio-description → Q&A flow. Jobs run
-in-process: uploads are queued onto an ``asyncio.Queue`` drained by a small
-fixed pool of worker tasks, progress is streamed over a websocket, and per-job
-temp dirs hold the keyframes that Q&A reads afterward.
+Stateless: every request resolves a Supabase JWT to a user id, reads and writes
+job state in Postgres, and hands media to the browser as presigned R2 URLs. No
+job state, no worker pool and no uploaded bytes live in this process, so it can
+run as many replicas as it likes behind a load balancer — unlike the previous
+version, which drained an in-process asyncio.Queue and served files off its own
+disk.
 
 Run with (preserving the flat-import convention that puts ``src/`` on sys.path):
 
     uv run uvicorn server:app --app-dir src --reload --reload-dir src
-
-Single worker process only — the in-memory JobStore is not shared across
-workers, so never pass ``--workers > 1``.
 """
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
-import qa
-from jobs import (
-    JOB_TTL_SEC,
-    STATUS_DONE,
-    STATUS_ERROR,
-    STATUS_PROCESSING,
-    TERMINAL_STATUSES,
-    Job,
-    JobStore,
-)
+import db
+import events
+import repo
+import tickets
+from auth import current_user, warn_if_insecure
+from blobs import JobBlobs
 from log_config import configure_logging
-from mux import DESCRIBED_FILENAME
-from pipeline import run_pipeline
+from tasks import answer_question as answer_question_task
+from tasks import enqueue_job
 from timeline import Timeline
 
 load_dotenv()
@@ -48,141 +41,83 @@ configure_logging()
 
 logger = logging.getLogger(__name__)
 
-# Number of jobs processed concurrently. Kept small on purpose: the CPU-bound
-# stages (VAD/Whisper/OpenCV) contend for cores, and torch intra-op threads are
-# pinned to 1 (below) so this is the only real parallelism knob.
-NUM_WORKERS = 2
-
-# Per-Gemini-request timeout (ms) so a single hung call fails the job instead
-# of pinning a worker slot forever.
-GEMINI_REQUEST_TIMEOUT_MS = 120_000
-
-# How often the background sweep runs to reclaim expired job dirs.
-SWEEP_INTERVAL_SEC = 300
-
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
-UPLOAD_CHUNK = 1024 * 1024
+# Refused before a presigned URL is even issued, and re-checked against the
+# object's real size before the job is enqueued — the browser uploads straight
+# to R2, so the API never sees the bytes and cannot enforce this mid-transfer.
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+# Long enough for a big upload over a slow connection.
+UPLOAD_URL_TTL_SEC = 3600
+
+# Media URLs handed to the browser, re-issued on every status read.
+MEDIA_URL_TTL_SEC = 3600
+
+# Cap on one presign batch, so a single request cannot be used to generate an
+# unbounded number of signed URLs.
+MAX_PRESIGN_BATCH = 500
+
+# How often an idle websocket pings, so a dead peer is noticed and the
+# connection does not sit open through an idle-timeout proxy.
+WS_PING_INTERVAL_SEC = 25
 
 
-def _get_pipeline_client(app: FastAPI) -> genai.Client:
-    """Lazily build the shared Gemini client used by the pipeline.
-
-    Built on first job (not at startup) so the server can boot and serve
-    status/frames endpoints even without a configured GEMINI_API_KEY.
-    """
-    client = getattr(app.state, "gemini_client", None)
-    if client is None:
-        logger.info(
-            "building shared Gemini client (timeout=%dms)", GEMINI_REQUEST_TIMEOUT_MS
-        )
-        client = genai.Client(
-            http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS)
-        )
-        app.state.gemini_client = client
-    return client
-
-
-async def _process_job(app: FastAPI, job_id: str) -> None:
-    store: JobStore = app.state.store
-    job = store.get(job_id)
-    if job is None:
-        logger.warning("job %s vanished before processing started", job_id)
-        return
-    video = job.source_video
-    if video is None:
-        logger.error("job %s has no uploaded video on disk", job_id)
-        store.set_status(job_id, STATUS_ERROR, error="uploaded video missing")
-        return
-
-    logger.info("job %s: starting pipeline for %s", job_id, video.name)
-    store.set_status(job_id, STATUS_PROCESSING)
-
-    async def on_event(event: dict) -> None:
-        if event.get("type") == "timeline":
-            with contextlib.suppress(Exception):
-                store.set_timeline(job_id, Timeline.model_validate(event["timeline"]))
-        store.publish(job_id, event)
-
-    try:
-        client = _get_pipeline_client(app)
-        timeline = await run_pipeline(video, job.dir, on_event, client=client)
-        store.set_timeline(job_id, timeline)
-        store.set_status(job_id, STATUS_DONE)
-        logger.info(
-            "job %s: pipeline finished (%d segments)", job_id, len(timeline.segments)
-        )
-    except Exception as exc:  # noqa: BLE001 - surface any stage failure to the client
-        logger.exception("job %s: pipeline failed", job_id)
-        store.set_status(job_id, STATUS_ERROR, error=f"{type(exc).__name__}: {exc}")
-
-
-async def _worker(app: FastAPI) -> None:
-    queue: asyncio.Queue = app.state.job_queue
-    while True:
-        job_id = await queue.get()
-        try:
-            await _process_job(app, job_id)
-        finally:
-            queue.task_done()
-
-
-async def _sweeper(app: FastAPI) -> None:
-    store: JobStore = app.state.store
-    while True:
-        await asyncio.sleep(SWEEP_INTERVAL_SEC)
-        try:
-            swept = store.sweep(ttl_sec=JOB_TTL_SEC)
-            if swept:
-                logger.info(
-                    "sweeper reclaimed %d expired job dir(s): %s", len(swept), swept
-                )
-        except Exception:
-            logger.exception("sweeper failed to reclaim expired jobs")
+def _suffix_of(filename: str | None) -> str:
+    return Path(filename or "").suffix.lower()
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Pin torch intra-op threads: Silero VAD and faster-whisper each parallelize
-    # internally, so without this concurrent jobs oversubscribe cores.
-    torch.set_num_threads(1)
-
-    store = JobStore()
-    store.recover()
-    app.state.store = store
-    app.state.job_queue = asyncio.Queue()
-    app.state.gemini_client = None
-
-    tasks = [asyncio.create_task(_worker(app)) for _ in range(NUM_WORKERS)]
-    tasks.append(asyncio.create_task(_sweeper(app)))
-    app.state.background_tasks = tasks
-    logger.info("adesc backend up: %d worker(s) + sweeper", NUM_WORKERS)
+    warn_if_insecure()
+    logger.info("adesc api up")
     try:
         yield
     finally:
-        logger.info(
-            "adesc backend shutting down, cancelling %d background task(s)", len(tasks)
-        )
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await db.close_pool()
+        await events.close_redis()
 
 
 app = FastAPI(title="adesc", lifespan=lifespan)
 
+
+def _allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_allowed_origins(),
+    # Vercel gives every preview deploy a generated hostname, so they cannot be
+    # enumerated in ALLOWED_ORIGINS. Set ALLOWED_ORIGIN_REGEX to match them —
+    # e.g. ^https://adesc-[a-z0-9-]+\.vercel\.app$ — and leave it unset in
+    # production, where the origin list is known and should stay exact.
+    allow_origin_regex=os.environ.get("ALLOWED_ORIGIN_REGEX") or None,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def _require_job(app: FastAPI, job_id: str) -> Job:
-    job = app.state.store.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job
+# --------------------------------------------------------------------------- #
+# request/response models
+# --------------------------------------------------------------------------- #
+
+
+class CreateJobRequest(BaseModel):
+    filename: str
+    content_type: str | None = None
+
+
+class CreateJobResponse(BaseModel):
+    job_id: str
+    upload_url: str
+    key: str
+
+
+class MediaUrlsRequest(BaseModel):
+    keys: list[str]
 
 
 class AskRequest(BaseModel):
@@ -190,148 +125,332 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
-    """Mirror of qa.QAResult: the answer plus the agent trajectory behind it."""
+    """A question is answered asynchronously; poll or watch the event stream."""
 
-    answer: str | None
+    run_id: str
     status: str
-    cycles: int
-    history: list[dict]
 
 
-@app.post("/api/jobs", status_code=202)
-async def create_job(file: UploadFile) -> dict:
-    store: JobStore = app.state.store
-    if store.at_capacity():
-        logger.warning(
-            "rejecting upload: at capacity (%d active jobs)", store.active_count()
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+
+async def _require_job(job_id: str, user_id: str) -> repo.Job:
+    try:
+        job = await repo.get_job(job_id, owner_id=user_id)
+    except ValueError as exc:  # a malformed id is simply not a job we have
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    if job is None:
+        # Deliberately the same response as someone else's job, so job ids
+        # cannot be probed for existence.
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+def _presign_timeline(timeline: Timeline, job_id: str) -> dict:
+    """Serialize a timeline with every blob key replaced by a fetchable URL.
+
+    The browser talks to R2 directly, so media bytes never pass through the
+    API — and the stored keys stay opaque rather than being exposed as paths.
+    """
+    blobs = JobBlobs.remote(job_id)
+    doc = timeline.model_dump()
+
+    def _url(key: str | None) -> str | None:
+        if not key:
+            return None
+        try:
+            return blobs.presign_get(key, ttl_sec=MEDIA_URL_TTL_SEC)
+        except RuntimeError:
+            # No bucket configured (local runs); leave the key for the client.
+            return key
+
+    for segment in doc["segments"]:
+        for frame in segment["frames"]:
+            frame["url"] = _url(frame["key"])
+        segment["ad_narration_url"] = _url(segment.get("ad_narration_key"))
+    doc["ad_track_url"] = _url(doc.get("ad_track_key"))
+    doc["described_url"] = _url(doc.get("described_key"))
+    return doc
+
+
+def _is_terminal(event: dict) -> bool:
+    return (
+        event.get("type") == "status" and event.get("status") in repo.TERMINAL_STATUSES
+    )
+
+
+# --------------------------------------------------------------------------- #
+# health
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    """Liveness: the process is up. Deliberately touches nothing else."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> dict:
+    """Readiness: this replica can actually serve traffic."""
+    checks = {}
+    try:
+        pool = await db.get_pool()
+        await pool.fetchval("select 1")
+        checks["postgres"] = "ok"
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        checks["postgres"] = f"error: {exc}"
+    try:
+        await events.get_redis().ping()
+        checks["redis"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        checks["redis"] = f"error: {exc}"
+
+    if any(value != "ok" for value in checks.values()):
+        raise HTTPException(status_code=503, detail=checks)
+    return {"status": "ok", **checks}
+
+
+# --------------------------------------------------------------------------- #
+# jobs
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/api/jobs", status_code=201)
+async def create_job(
+    body: CreateJobRequest, user_id: str = Depends(current_user)
+) -> CreateJobResponse:
+    """Reserve a job and hand back a presigned URL to PUT the video to.
+
+    The browser uploads straight to R2: the API never touches the bytes, so a
+    large upload neither occupies a request nor lands on this machine's disk.
+    """
+    if await repo.at_capacity(user_id):
+        raise HTTPException(
+            status_code=429,
+            detail=f"you already have {repo.MAX_ACTIVE_JOBS_PER_USER} jobs in flight",
         )
-        raise HTTPException(status_code=503, detail="server busy, too many active jobs")
 
-    suffix = Path(file.filename or "").suffix.lower()
+    suffix = _suffix_of(body.filename)
     if suffix not in ALLOWED_VIDEO_SUFFIXES:
-        logger.warning(
-            "rejecting upload %r: unsupported type %r", file.filename, suffix
-        )
         raise HTTPException(
             status_code=400, detail=f"unsupported video type: {suffix or 'unknown'}"
         )
 
-    job = store.create()
-    dest = job.dir / f"source{suffix}"
+    source_key = f"source{suffix}"
+    job = await repo.create_job(user_id, body.filename, source_key)
+    blobs = JobBlobs.remote(job.id)
     try:
-        with open(dest, "wb") as out:
-            while chunk := await file.read(UPLOAD_CHUNK):
-                out.write(chunk)
-    finally:
-        await file.close()
+        upload_url = blobs.presign_put(
+            source_key, ttl_sec=UPLOAD_URL_TTL_SEC, content_type=body.content_type
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail="object storage unavailable"
+        ) from exc
 
-    logger.info(
-        "job %s: queued upload %r (%d bytes)",
-        job.id,
-        file.filename,
-        dest.stat().st_size,
-    )
-    await app.state.job_queue.put(job.id)
-    return {"job_id": job.id}
+    logger.info("job %s: reserved for %s (%s)", job.id, user_id, body.filename)
+    return CreateJobResponse(job_id=job.id, upload_url=upload_url, key=source_key)
 
 
-@app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str) -> dict:
-    job = _require_job(app, job_id)
+@app.post("/api/jobs/{job_id}/start", status_code=202)
+async def start_job(job_id: str, user_id: str = Depends(current_user)) -> dict:
+    """Enqueue a job once its source video has landed in the bucket."""
+    job = await _require_job(job_id, user_id)
+    if job.status != repo.STATUS_CREATED:
+        raise HTTPException(status_code=409, detail=f"job is already {job.status}")
+
+    blobs = JobBlobs.remote(job_id)
+    size = blobs.size(job.source_key or "")
+    if size is None:
+        raise HTTPException(status_code=400, detail="no video was uploaded")
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"video is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+        )
+
+    await repo.set_status(job_id, repo.STATUS_QUEUED)
+    enqueue_job(job_id)
+    logger.info("job %s: queued (%d bytes)", job_id, size)
+    return {"job_id": job_id, "status": repo.STATUS_QUEUED}
+
+
+@app.get("/api/jobs")
+async def list_jobs(user_id: str = Depends(current_user)) -> dict:
+    jobs = await repo.list_jobs(user_id)
     return {
-        "id": job.id,
-        "status": job.status,
-        "error": job.error,
-        "timeline": job.timeline.model_dump() if job.timeline is not None else None,
+        "jobs": [
+            {
+                "id": job.id,
+                "status": job.status,
+                "stage": job.stage,
+                "filename": job.filename,
+                "duration_sec": job.duration_sec,
+                "created_at": job.created_at.isoformat(),
+            }
+            for job in jobs
+        ]
     }
 
 
-@app.get("/api/jobs/{job_id}/frames/{filename}")
-async def get_frame(job_id: str, filename: str) -> FileResponse:
-    job = _require_job(app, job_id)
-    if not filename.endswith(".jpg"):
-        raise HTTPException(status_code=404, detail="not found")
+@app.post("/api/jobs/{job_id}/media-urls")
+async def media_urls(
+    job_id: str, body: MediaUrlsRequest, user_id: str = Depends(current_user)
+) -> dict:
+    """Presign a batch of this job's blob keys.
 
-    frames_dir = (job.dir / "frames").resolve()
-    target = (frames_dir / filename).resolve()
-    if not target.is_relative_to(frames_dir) or not target.is_file():
-        raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(target, media_type="image/jpeg")
+    Progress events carry keys, not URLs — a presigned URL expires, and the
+    event log is durable and replayed on reconnect, so baking one in would mean
+    replaying dead links. The client asks for URLs when it needs them instead.
 
-
-@app.get("/api/jobs/{job_id}/narration/{filename}")
-async def get_narration(job_id: str, filename: str) -> FileResponse:
-    job = _require_job(app, job_id)
-    if not filename.endswith(".wav"):
-        raise HTTPException(status_code=404, detail="not found")
-
-    narration_dir = (job.dir / "narration").resolve()
-    target = (narration_dir / filename).resolve()
-    if not target.is_relative_to(narration_dir) or not target.is_file():
-        raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(target, media_type="audio/wav")
-
-
-@app.get("/api/jobs/{job_id}/described")
-async def get_described_video(job_id: str) -> FileResponse:
-    """The muxed video: original picture + soundtrack with narration mixed in.
-
-    A single well-known artifact per job, so there's no filename parameter (and
-    hence no traversal surface) — unlike the frames/narration endpoints.
+    ``<img>``/``<audio>``/``<video>`` cannot send an Authorization header, which
+    is why these have to be self-authenticating URLs rather than an API route
+    that streams or redirects.
     """
-    job = _require_job(app, job_id)
-    target = job.dir / DESCRIBED_FILENAME
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="described video not available")
-    # FileResponse serves Range requests, which the browser needs in order to seek.
-    return FileResponse(target, media_type="video/mp4")
-
-
-@app.post("/api/jobs/{job_id}/ask")
-async def ask(job_id: str, body: AskRequest) -> AskResponse:
-    job = _require_job(app, job_id)
-    if not job.dir.exists():
-        raise HTTPException(status_code=410, detail="job data expired")
-    if job.status != STATUS_DONE or job.timeline is None:
-        raise HTTPException(status_code=409, detail="job not finished")
-
-    logger.info("job %s: Q&A question=%r", job_id, body.question)
-    try:
-        result = await qa.answer_question(
-            job.timeline, body.question, _get_pipeline_client(app)
-        )
-    except Exception as exc:  # noqa: BLE001 - never leak a stack trace to the client
-        logger.exception("job %s: Q&A failed", job_id)
+    await _require_job(job_id, user_id)
+    if len(body.keys) > MAX_PRESIGN_BATCH:
         raise HTTPException(
-            status_code=500, detail=f"could not answer question: {exc}"
-        ) from exc
-    return AskResponse(**result.model_dump())
+            status_code=400, detail=f"at most {MAX_PRESIGN_BATCH} keys per request"
+        )
+
+    blobs = JobBlobs.remote(job_id)
+    urls: dict[str, str] = {}
+    for key in body.keys:
+        # Keys come from the client, so refuse anything that could address
+        # another job's objects.
+        if key.startswith("/") or ".." in key:
+            continue
+        with contextlib.suppress(RuntimeError):
+            urls[key] = blobs.presign_get(key, ttl_sec=MEDIA_URL_TTL_SEC)
+    return {"urls": urls}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str, user_id: str = Depends(current_user)) -> dict:
+    job = await _require_job(job_id, user_id)
+    timeline = await repo.get_timeline(job_id)
+    return {
+        "id": job.id,
+        "status": job.status,
+        "stage": job.stage,
+        "error": job.error,
+        "timeline": _presign_timeline(timeline, job_id) if timeline else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# live progress
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/api/jobs/{job_id}/ws-ticket")
+async def create_ws_ticket(job_id: str, user_id: str = Depends(current_user)) -> dict:
+    """A short-lived, single-use credential for the event websocket."""
+    await _require_job(job_id, user_id)
+    return {"ticket": await tickets.issue(user_id, job_id)}
 
 
 @app.websocket("/api/jobs/{job_id}/events")
 async def job_events(websocket: WebSocket, job_id: str) -> None:
-    await websocket.accept()
-    store: JobStore = websocket.app.state.store
-    if store.get(job_id) is None:
-        logger.warning("ws rejected: unknown job %s", job_id)
+    """Replay everything missed, then stream live until the job is terminal.
+
+    ``?since=`` is the last sequence the client already has, so a reconnect
+    resumes instead of replaying the whole log — the previous implementation
+    could only replay from zero. Live events arrive over Redis pub/sub, so it
+    does not matter which replica holds the socket or which worker produced
+    the event.
+    """
+    redeemed = await tickets.redeem(websocket.query_params.get("ticket", ""))
+    if redeemed is None or redeemed[1] != job_id:
+        await websocket.close(code=4401)
+        return
+    user_id, _ = redeemed
+
+    try:
+        job = await repo.get_job(job_id, owner_id=user_id)
+    except ValueError:
+        job = None
+    if job is None:
         await websocket.close(code=4004)
         return
 
-    logger.debug("ws subscribed to job %s", job_id)
-    queue: asyncio.Queue = asyncio.Queue()
-    store.subscribe(job_id, queue)
+    await websocket.accept()
     try:
-        while True:
-            event = await queue.get()
+        since = int(websocket.query_params.get("since", "0"))
+    except ValueError:
+        since = 0
+
+    pubsub = events.get_redis().pubsub()
+    # Subscribe *before* replaying, so an event published during the replay is
+    # buffered rather than lost in the gap between the two.
+    await pubsub.subscribe(events.channel(job_id))
+    try:
+        seen = since
+        for event in await repo.events_since(job_id, since):
             await websocket.send_json(event)
-            if (
-                event.get("type") == "status"
-                and event.get("status") in TERMINAL_STATUSES
-            ):
-                break
-    except WebSocketDisconnect:
-        logger.debug("ws disconnected from job %s", job_id)
+            seen = event.get("seq", seen)
+            if _is_terminal(event):
+                return
+
+        while True:
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=WS_PING_INTERVAL_SEC
+            )
+            if message is None:
+                # Also how a disconnected client is noticed: send_json raises.
+                await websocket.send_json({"type": "ping"})
+                continue
+            event = json.loads(message["data"])
+            # Replay and live stream overlap by design; drop the duplicates.
+            if event.get("seq", 0) <= seen:
+                continue
+            seen = event.get("seq", seen)
+            await websocket.send_json(event)
+            if _is_terminal(event):
+                return
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        logger.debug("job %s: websocket closed by client", job_id)
+    except Exception:
+        logger.exception("job %s: websocket stream failed", job_id)
     finally:
-        store.unsubscribe(job_id, queue)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(Exception):
+            await pubsub.unsubscribe(events.channel(job_id))
+            await pubsub.aclose()
+        with contextlib.suppress(Exception):
             await websocket.close()
+
+
+# --------------------------------------------------------------------------- #
+# Q&A
+# --------------------------------------------------------------------------- #
+
+
+@app.post("/api/jobs/{job_id}/ask", status_code=202)
+async def ask(
+    job_id: str, body: AskRequest, user_id: str = Depends(current_user)
+) -> AskResponse:
+    """Queue a question. A run takes minutes, so it is not answered inline."""
+    job = await _require_job(job_id, user_id)
+    if job.status != repo.STATUS_DONE:
+        raise HTTPException(status_code=409, detail="job not finished")
+    if await repo.get_timeline(job_id) is None:
+        raise HTTPException(status_code=410, detail="job data expired")
+
+    run_id = await repo.create_qa_run(job_id, user_id, body.question)
+    answer_question_task.apply_async(args=[run_id, job_id])
+    logger.info("job %s: queued Q&A run %s", job_id, run_id)
+    return AskResponse(run_id=run_id, status="queued")
+
+
+@app.get("/api/qa/{run_id}")
+async def get_qa_run(run_id: str, user_id: str = Depends(current_user)) -> dict:
+    try:
+        run = await repo.get_qa_run(run_id, user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="run not found") from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run

@@ -1,13 +1,13 @@
 """Small shared helpers: time formatting, resilient JSON parsing, retries."""
 
-import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
 
 from google.genai import types
 
-from qa.config import RETRY_ATTEMPTS, RETRY_BASE_DELAY_SEC, TEXT_MODEL
+import gemini_limits
+from qa.config import RETRY_ATTEMPTS, TEXT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -101,25 +101,11 @@ async def fix_and_parse_json(json_string: str | None, client) -> dict | None:
 async def with_retries[T](
     fn: Callable[[], Awaitable[T]], attempts: int = RETRY_ATTEMPTS
 ) -> T:
-    """Run async ``fn()`` with exponential backoff on any exception.
+    """Rate-limit and run async ``fn()``, retrying only transient failures.
 
-    Replaces Symphony's 5×(60s, doubling) transport retry; per-request
-    timeouts come from the injected Gemini client.
+    Kept as the QA package's entry point (every agent and tool calls it), but
+    the policy itself lives in ``gemini_limits`` so the pipeline stages and the
+    Q&A agents draw on one shared, cross-worker rate limit rather than each
+    process backing off on its own.
     """
-    delay = RETRY_BASE_DELAY_SEC
-    for attempt in range(1, attempts + 1):
-        try:
-            return await fn()
-        except Exception:
-            if attempt == attempts:
-                raise
-            logger.warning(
-                "attempt %d/%d failed, retrying in %.1fs",
-                attempt,
-                attempts,
-                delay,
-                exc_info=True,
-            )
-            await asyncio.sleep(delay)
-            delay *= 2
-    raise RuntimeError("unreachable: retry loop exited without returning")
+    return await gemini_limits.with_retries(fn, attempts=attempts)

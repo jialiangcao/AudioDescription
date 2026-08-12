@@ -13,16 +13,22 @@ from qa.subtitle_agent import SubtitleAgent
 from timeline import Frame, Segment, Timeline
 
 
+class _FakeBlobs:
+    """The scripted agents never touch storage, so a job id is all that's needed."""
+
+    job_id = "test-job"
+
+
 def _timeline():
     return Timeline(
-        video_id="v.mp4",
+        job_id="v.mp4",
         duration_sec=10.0,
         segments=[
             Segment(
                 id=0,
                 start=0.0,
                 end=10.0,
-                frames=[Frame(index=0, time=0.0, path="f.jpg")],
+                frames=[Frame(index=0, time=0.0, key="frames/f.jpg")],
             )
         ],
     )
@@ -66,7 +72,8 @@ def _system(decisions, assessments=({"credible": True},), max_cycles=17):
         timeline=_timeline(),
         question="q?",
         client=FakeGeminiClient(),
-        frame_index=FrameIndex(entries=[(0.0, "f.jpg")], duration_sec=10.0),
+        blobs=_FakeBlobs(),
+        frame_index=FrameIndex(entries=[(0.0, "frames/f.jpg")], duration_sec=10.0),
         max_cycles=max_cycles,
     )
     fakes = SimpleNamespace(
@@ -189,7 +196,77 @@ async def test_answer_question_entrypoint(monkeypatch):
     # The public wrapper builds the FrameIndex and runs the system end-to-end;
     # with the canned client the planner immediately finishes and reflection
     # approves.
-    result = await answer_question(_timeline(), "q?", FakeGeminiClient())
+    result = await answer_question(_timeline(), "q?", FakeGeminiClient(), _FakeBlobs())
     assert result.status == "completed"
     assert result.answer == "a canned answer"
     assert result.history[-1] == {"action": "finish", "answer": "a canned answer"}
+
+
+# --------------------------------------------------------------------------- #
+# streaming
+#
+# The reason the loop became a graph: every transition is a named node, so a
+# run can be reported step by step instead of only at the end.
+# --------------------------------------------------------------------------- #
+
+
+async def test_run_streams_each_step_as_it_happens():
+    system, _ = _system(
+        [
+            {"reason": "look", "agent": "PerceptionAgent", "instruct": "check"},
+            {"reason": "done", "agent": "finish", "answer": "42"},
+        ]
+    )
+    steps = []
+
+    async def on_step(node, records):
+        steps.append((node, records))
+
+    result = await system.run(on_step=on_step)
+
+    assert [node for node, _ in steps] == ["plan", "perception", "plan", "finish"]
+    # The records streamed are exactly the history that comes back at the end,
+    # in the same order — the panel built live matches the finished trace.
+    streamed = [record for _, records in steps for record in records]
+    assert streamed == result.history
+
+
+async def test_streaming_produces_the_same_result_as_running_straight_through():
+    """Folding the streamed updates must reconstruct the same final state."""
+    decisions = [
+        {"reason": "dialogue", "agent": "SubtitleAgent"},
+        {"reason": "done", "agent": "finish", "answer": "blue"},
+    ]
+
+    plain, _ = _system(list(decisions))
+    plain_result = await plain.run()
+
+    streamed_system, _ = _system(list(decisions))
+
+    async def on_step(node, records):
+        return None
+
+    streamed_result = await streamed_system.run(on_step=on_step)
+
+    assert streamed_result.model_dump() == plain_result.model_dump()
+
+
+async def test_streaming_reports_a_rejected_answer_too():
+    system, _ = _system(
+        [
+            {"reason": "guess", "agent": "finish", "answer": "maybe"},
+            {"reason": "sure now", "agent": "finish", "answer": "definitely"},
+        ],
+        assessments=[{"credible": False, "comment": "thin evidence"}],
+    )
+    steps = []
+
+    async def on_step(node, records):
+        steps.append((node, records))
+
+    result = await system.run(on_step=on_step)
+
+    assert result.answer == "definitely"
+    finish_steps = [records for node, records in steps if node == "finish"]
+    # The first finish streams its rejection, so the user sees the retry happen.
+    assert finish_steps[0][-1]["assessment"] == "not_credible"

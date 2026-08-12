@@ -1,0 +1,70 @@
+# The media-queue worker: shot detection, audio extraction, VAD, transcription,
+# TTS, AD-track assembly and the mux — plus the qa queue, whose CLIP retriever
+# needs torch.
+#
+# Large by nature (~4GB). Two deliberate choices keep that from hurting at
+# runtime:
+#
+#   * ffmpeg/ffprobe and espeak-ng are installed here and nowhere else. They
+#     were previously undeclared dependencies — the code shells out to them but
+#     nothing said so.
+#   * The model weights are baked into the image. faster-whisper `small`
+#     (~250MB), Kokoro-82M (~330MB) and CLIP ViT-B-32 (~600MB) were downloaded
+#     lazily on first use, inside the request path, so the first job after a
+#     cold start paid ~1.2GB of downloads before it could start.
+
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    HF_HOME=/opt/models/hf \
+    TORCH_HOME=/opt/models/torch
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        espeak-ng \
+        libsndfile1 \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --extra media --no-install-project
+
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Bake the weights. Its own layer, so it survives every source change and only
+# rebuilds when the dependency set does.
+COPY docker/warm_models.py /tmp/warm_models.py
+RUN python /tmp/warm_models.py && rm /tmp/warm_models.py
+
+COPY src/ ./src/
+
+# Scratch lives on a mounted volume in production; the dir must exist either way.
+ENV ADESC_SCRATCH_ROOT=/scratch
+RUN mkdir -p /scratch \
+    && useradd --create-home --uid 10001 adesc \
+    && chown -R adesc:adesc /app /scratch /opt/models
+USER adesc
+
+# Concurrency 1, prefork: the Kokoro pipeline is a single shared, non-reentrant
+# model instance, and these stages already saturate a core each. Serves the qa
+# queue too, since its CLIP retriever needs the torch that only this image has.
+ENV QUEUES=media,qa
+CMD ["celery", "--app", "celery_app", "worker", \
+     "--queues", "media,qa", "--concurrency", "1", "--pool", "prefork", \
+     "--loglevel", "INFO"]
+
+# --- beat ------------------------------------------------------------------
+# The scheduler for the stale-job reaper. Exactly one of these must run.
+FROM base AS beat
+CMD ["celery", "--app", "celery_app", "beat", "--loglevel", "INFO"]
