@@ -120,6 +120,10 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
 
+      # This also runs the image: docker/smoke.py is the Dockerfile's last layer,
+      # so a native-dependency fault (the kind that imports fine and dies mid-job)
+      # fails the build here rather than on a deployed worker. No `load: true`
+      # needed — it runs on the builder, at the arch production uses.
       - name: Build media image
         uses: docker/build-push-action@v6
         with:

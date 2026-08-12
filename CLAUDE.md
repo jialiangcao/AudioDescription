@@ -283,7 +283,14 @@ Two images, four Fly apps, one Vercel project.
 - `docker/Dockerfile.media` — the media+qa worker and beat (`--target beat`). Installs
   `ffmpeg`/`espeak-ng` (previously undeclared system dependencies) and **bakes the model weights
   in** via `docker/warm_models.py`, so a cold start no longer pays ~1.2GB of downloads inside the
-  first job.
+  first job. Its **final layer runs `docker/smoke.py`**, which pushes a synthetic 3s clip through
+  segmentation → audio extraction → VAD → transcription → TTS → mux. Building the image proves
+  nothing about whether it *runs*: these stages reach native code (OpenCV, ffmpeg, libsndfile,
+  espeak-ng, torch's shared libraries) that no earlier layer exercises, and that class of fault
+  otherwise surfaces mid-job on a deployed worker. The same script is the fast way to interrogate
+  a suspect image — `fly ssh console -a adesc-worker-media -C "python /app/docker/smoke.py"`, or
+  locally with `src/` bind-mounted over `/app/src` so a code change needs no rebuild. Build it
+  with `--platform linux/amd64` on Apple silicon or the arch that breaks is not the arch you test.
 - `fly/*.toml` — one per app. Only the media worker mounts a volume (scratch); everything else is
   stateless.
 - `.github/workflows/ci.yml` — lint, typecheck and pytest against real Postgres/Redis service

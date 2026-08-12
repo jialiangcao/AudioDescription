@@ -54,7 +54,21 @@ ENV ADESC_SCRATCH_ROOT=/scratch
 RUN mkdir -p /scratch \
     && useradd --create-home --uid 10001 adesc \
     && chown -R adesc:adesc /app /scratch /opt/models
+
+# BuildKit leaves HOME at /root across a USER switch, so anything that falls
+# back to a home-directory cache (spacy, huggingface_hub outside HF_HOME) would
+# try to write somewhere adesc cannot.
+ENV HOME=/home/adesc
 USER adesc
+
+# Prove the image *runs*, not just that it builds. Every stage below reaches
+# native code (OpenCV, ffmpeg, libsndfile, espeak-ng, torch's shared libraries)
+# that no earlier layer exercises, so this is the only place a linking or
+# missing-binary fault surfaces before a real job hits it — see docker/smoke.py.
+# Last layer, and after USER, so it also covers what the unprivileged user can
+# read; it rebuilds with the source it is testing and adds a few seconds.
+COPY docker/smoke.py ./docker/smoke.py
+RUN python docker/smoke.py
 
 # Concurrency 1, prefork: the Kokoro pipeline is a single shared, non-reentrant
 # model instance, and these stages already saturate a core each. Serves the qa

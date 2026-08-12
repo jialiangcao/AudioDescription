@@ -1,0 +1,55 @@
+#!/bin/sh
+# Run the backend half of CI before a push to main can leave this machine.
+#
+# CI and Deploy are separate workflows on the same `push` event: they start
+# together and neither waits for the other, so a red CI does not stop a deploy.
+# The `production` approval gate is the only thing in between, and that is a
+# human comparing two browser tabs. GitHub's branch protection would enforce
+# this properly, but it is gated behind Pro for private repos — so the check
+# runs here instead, before the push exists at all.
+#
+# Backend only, deliberately: these are the checks that gate what reaches Fly.
+# The frontend deploys to Vercel, where a failed build stops at Vercel and
+# leaves the previous deployment serving, so it does not belong in this path.
+#
+# Installed via `git config core.hooksPath .githooks` (tracked, unlike
+# .git/hooks). Bypass with `git push --no-verify` when you mean to.
+
+set -e
+
+BRANCH="refs/heads/main"
+ZERO="0000000000000000000000000000000000000000"
+
+# stdin gets one "<local ref> <local sha> <remote ref> <remote sha>" line per
+# ref being pushed. Only main matters, and a deletion has nothing to check.
+pushing_main=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    if [ "$remote_ref" = "$BRANCH" ] && [ "$local_sha" != "$ZERO" ]; then
+        pushing_main=1
+    fi
+done
+
+if [ "$pushing_main" -eq 0 ]; then
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-push: running backend checks before pushing to main…"
+
+# The repo/tasks/server tests need Postgres. They skip when none is configured,
+# but error loudly when one is configured and unreachable — so say why up front
+# rather than letting that look like a code failure.
+if command -v docker >/dev/null 2>&1; then
+    if ! docker compose ps --services --status running 2>/dev/null | grep -q postgres; then
+        echo "pre-push: warning — docker compose postgres is not running."
+        echo "pre-push:   the repo/tasks/server tests need it: docker compose up -d postgres"
+    fi
+fi
+
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright src
+uv run pytest -q
+
+echo "pre-push: ok"
