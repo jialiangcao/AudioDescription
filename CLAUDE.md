@@ -274,6 +274,7 @@ pinned to `WARNING` unless the level is `DEBUG`.
 
 ### Deployment
 
+See `docs/DEPLOY.md` for the full guide (accounts, CLIs, provisioning, secrets).
 Two images, four Fly apps, one Vercel project.
 
 - `docker/Dockerfile.slim` — API (`--target api`) and gemini worker (`--target worker`). Carries
