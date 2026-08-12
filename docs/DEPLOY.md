@@ -291,7 +291,7 @@ prod.
 
 | Setting | Value | Why |
 |---|---|---|
-| Framework Preset | **Next.js** | Detected automatically once the root directory is right. |
+| Framework Preset | **Next.js** | Pinned by `frontend/vercel.json`, which takes precedence over the dashboard. If this is left on "Other", the build itself succeeds and then fails with `No Output Directory named "public" found` — Vercel looks for a static site instead of `.next`. |
 | **Root Directory** | **`frontend`** | The repo is a monorepo; without this the build fails immediately. Leave "Include files outside the root directory" **off** — the frontend needs nothing from `src/`. |
 | Build Command | default (`next build`) | |
 | Install Command | default (`npm install`) | |
