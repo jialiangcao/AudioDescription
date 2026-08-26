@@ -49,7 +49,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync --frozen --extra media
+      - run: uv sync --frozen --extra media --extra bench
 
       - name: Lint
         run: |
@@ -104,7 +104,7 @@ jobs:
           docker run --rm --entrypoint python adesc-slim:ci -c "
           import sys; sys.path.insert(0, '/app/src')
           import tasks, server, celery_app
-          for banned in ('torch', 'cv2', 'faster_whisper', 'kokoro', 'open_clip'):
+          for banned in ('torch', 'cv2', 'faster_whisper', 'kokoro', 'open_clip', 'yt_dlp'):
               assert banned not in sys.modules, f'{banned} was imported into the slim image'
           print('slim image imports cleanly')
           "

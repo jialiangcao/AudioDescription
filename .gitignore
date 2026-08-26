@@ -7,3 +7,7 @@ src/in/*
 .claude
 .DS_Store
 .ruff_cache
+# Benchmark harness working data: downloaded clips, per-clip scratch, and
+# run outputs. The sample CSV is kept as a smoke fixture.
+data/*
+!data/sample_cmd_ad.csv
