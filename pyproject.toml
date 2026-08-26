@@ -48,6 +48,7 @@ media = [
 # neither Docker image — it runs on a developer's machine, against local files.
 bench = [
     "bert-score>=0.3.13",
+    "pyarrow>=18",
     "pycocoevalcap>=1.2",
     "yt-dlp>=2026.1.26",
 ]

@@ -69,6 +69,38 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--results", default=RESULTS_PATH)
     report.add_argument("--out", default=DATA_ROOT / "report.html")
 
+    qa_run = sub.add_parser(
+        "qa-run", help="run the Q&A agent against a video-QA benchmark"
+    )
+    qa_run.add_argument(
+        "--dataset", default="video-mme", choices=["video-mme", "cinepile"]
+    )
+    qa_run.add_argument(
+        "--duration", default="short", help="video-mme: short|medium|long"
+    )
+    qa_run.add_argument("--videos", type=int, default=10, help="videos to cover")
+    qa_run.add_argument(
+        "--mode",
+        default="agent",
+        choices=["agent", "blind", "subtitles"],
+        help="agent = the real system; blind/subtitles are the controls",
+    )
+    qa_run.add_argument("--clips-dir", default=DATA_ROOT / "qa_clips")
+    qa_run.add_argument("--work-dir", default=DATA_ROOT / "qa_work")
+    qa_run.add_argument(
+        "--out", default=None, help="default: data/qa_<mode>_preds.jsonl"
+    )
+    qa_run.add_argument("--interval-sec", type=float, default=INTERVAL_SEC)
+    qa_run.add_argument("--force", action="store_true")
+
+    qa_report = sub.add_parser(
+        "qa-report", help="accuracy, controls and every question"
+    )
+    qa_report.add_argument(
+        "--preds", nargs="+", required=True, help="one file per mode"
+    )
+    qa_report.add_argument("--out", default=DATA_ROOT / "qa_report.html")
+
     score = sub.add_parser("score", help="CIDEr + LLM-AD-eval over the predictions")
     score.add_argument("--preds", default=PREDS_PATH)
     score.add_argument("--out", default=RESULTS_PATH)
@@ -136,6 +168,50 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         print(json.dumps(summary, indent=2))
+        return 0
+
+    if args.command == "qa-run":
+        from bench.qa_dataset import load_cinepile, load_videomme
+        from bench.qa_run import run_benchmark as qa_run_benchmark
+
+        items = (
+            load_videomme(args.duration, limit_videos=args.videos)
+            if args.dataset == "video-mme"
+            else load_cinepile(limit_videos=args.videos)
+        )
+        out = args.out or (DATA_ROOT / f"qa_{args.mode}_preds.jsonl")
+        summary = asyncio.run(
+            qa_run_benchmark(
+                items,
+                args.clips_dir,
+                args.work_dir,
+                out,
+                mode=args.mode,
+                interval_sec=args.interval_sec,
+                force=args.force,
+            )
+        )
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    if args.command == "qa-report":
+        from bench.qa_report import build_report as build_qa_report
+        from bench.qa_report import common_questions, load_runs, summarize_run
+
+        path = build_qa_report(args.preds, args.out)
+        runs = load_runs(args.preds)
+        # The same restriction the report applies: every mode scored over the
+        # questions all of them measured. Without it this printout and the
+        # report disagree, and the mode that lost videos looks worse for it.
+        shared = common_questions(runs) if len(runs) > 1 else None
+        for mode, records in runs.items():
+            s_ = summarize_run(records, only=shared)
+            print(
+                f"  {mode:12} {s_['accuracy']:5.1f}%  "
+                f"CI [{s_['ci'][0]}, {s_['ci'][1]}]  "
+                f"n={s_['questions']}  chance={s_['chance']}%"
+            )
+        print(f"wrote {path}")
         return 0
 
     if args.command == "report":
