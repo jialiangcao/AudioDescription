@@ -354,3 +354,77 @@ async def test_reap_task_marks_abandoned_jobs(db, owner, eager):
     fetched = await repo.get_job(job.id, owner_id=owner)
     assert fetched is not None
     assert fetched.status == repo.STATUS_INTERRUPTED
+
+
+# --------------------------------------------------------------------------- #
+# stage 0: fetching a URL source
+# --------------------------------------------------------------------------- #
+
+
+async def test_fetch_source_downloads_then_runs_the_whole_canvas(
+    db, owner, eager, stub_stages, synthetic_video, monkeypatch
+):
+    """A URL job joins the same canvas one stage earlier, and every later stage
+    sees the world it would have seen after an upload."""
+    job = await repo.create_job(
+        owner, None, "source.mp4", source_url="https://youtu.be/_SQr8I3lcW8"
+    )
+
+    def _fake_download(url, dest, max_height=720):
+        Path(dest).write_bytes(Path(synthetic_video).read_bytes())
+        return {"id": "_SQr8I3lcW8", "title": "A Clip", "duration_sec": 4.0}
+
+    monkeypatch.setattr(tasks, "probe_youtube", lambda url: {"duration_sec": 4.0})
+    monkeypatch.setattr(tasks, "download_youtube", _fake_download)
+
+    tasks.fetch_source.apply(args=[job.id]).get()
+
+    fetched = await repo.get_job(job.id, owner_id=owner)
+    assert fetched is not None
+    assert fetched.status == repo.STATUS_DONE
+    # The job is named after the video it fetched, so it reads like an upload.
+    assert fetched.filename == "A Clip"
+
+    timeline = await repo.get_timeline(job.id)
+    assert timeline is not None
+    assert timeline.described_key == "described.mp4"
+
+    events = await repo.events_since(job.id)
+    stages = [e["stage"] for e in events if e.get("type") == "stage"]
+    assert stages[0] == "fetch"
+    assert "segmentation" in stages
+
+
+async def test_fetch_source_rejects_a_video_longer_than_the_cap(
+    db, owner, eager, stub_stages, fast_retries, monkeypatch
+):
+    """Length is the only size signal available before paying for the bytes."""
+    job = await repo.create_job(
+        owner, None, "source.mp4", source_url="https://youtu.be/x"
+    )
+    monkeypatch.setattr(tasks.fetch_source, "max_retries", 0)
+    monkeypatch.setattr(
+        tasks,
+        "probe_youtube",
+        lambda url: {"duration_sec": tasks.MAX_SOURCE_DURATION_SEC + 1},
+    )
+
+    def _must_not_download(*_args, **_kwargs):
+        raise AssertionError("downloaded a video that should have been refused")
+
+    monkeypatch.setattr(tasks, "download_youtube", _must_not_download)
+
+    with pytest.raises(tasks.IngestError):
+        tasks.fetch_source.apply(args=[job.id]).get()
+
+    fetched = await repo.get_job(job.id, owner_id=owner)
+    assert fetched is not None
+    assert fetched.status == repo.STATUS_ERROR
+    assert "the limit is" in (fetched.error or "")
+
+
+async def test_fetch_source_refuses_a_job_with_no_url(db, owner, eager, stub_stages):
+    job = await repo.create_job(owner, "clip.mp4", "source.mp4")
+
+    with pytest.raises(RuntimeError, match="no source URL"):
+        tasks.fetch_source.apply(args=[job.id]).get()

@@ -76,7 +76,13 @@ class FakeBlobs:
 def enqueued(monkeypatch):
     """Capture what the API hands to Celery instead of running it."""
     jobs, questions = [], []
-    monkeypatch.setattr(server, "enqueue_job", jobs.append)
+    # Records (job_id, from_url): the entry stage differs between an upload,
+    # which starts at segmentation, and a URL, which starts at the fetch.
+    monkeypatch.setattr(
+        server,
+        "enqueue_job",
+        lambda job_id, from_url=False: jobs.append((job_id, from_url)),
+    )
     monkeypatch.setattr(
         server.answer_question_task,
         "apply_async",
@@ -243,6 +249,55 @@ def test_create_job_enforces_the_per_user_quota(client):
     assert response.status_code == 429
 
 
+def test_create_job_from_url_queues_it_without_an_upload_step(client, enqueued):
+    """No presign, no /start: there is nothing to upload and nothing to verify."""
+    response = client.post(
+        "/api/jobs/from-url", json={"url": "https://youtu.be/_SQr8I3lcW8"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == repo.STATUS_QUEUED
+    # from_url=True: the canvas has to start one stage earlier, at the fetch.
+    assert enqueued[0] == [(body["job_id"], True)]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://vimeo.com/12345",
+        "https://youtube.com.evil.test/watch?v=x",
+        "file:///etc/passwd",
+    ],
+)
+def test_create_job_from_url_refuses_a_host_we_do_not_fetch(client, enqueued, url):
+    response = client.post("/api/jobs/from-url", json={"url": url})
+
+    assert response.status_code == 400
+    assert enqueued[0] == []
+
+
+def test_create_job_from_url_enforces_the_per_user_quota(client, enqueued):
+    for _ in range(repo.MAX_ACTIVE_JOBS_PER_USER):
+        client.post("/api/jobs/from-url", json={"url": "https://youtu.be/aaaaaaaaaaa"})
+
+    response = client.post(
+        "/api/jobs/from-url", json={"url": "https://youtu.be/bbbbbbbbbbb"}
+    )
+    assert response.status_code == 429
+
+
+async def test_a_url_job_records_the_url_it_will_fetch(client, owner):
+    job_id = client.post(
+        "/api/jobs/from-url", json={"url": "https://youtu.be/_SQr8I3lcW8"}
+    ).json()["job_id"]
+
+    job = await repo.get_job(job_id, owner_id=owner)
+    assert job is not None
+    assert job.source_url == "https://youtu.be/_SQr8I3lcW8"
+    assert job.source_key == "source.mp4"
+
+
 def test_start_enqueues_the_job(client, enqueued):
     job_id = client.post("/api/jobs", json={"filename": "clip.mp4"}).json()["job_id"]
 
@@ -251,7 +306,7 @@ def test_start_enqueues_the_job(client, enqueued):
     assert response.status_code == 202
     assert response.json()["status"] == repo.STATUS_QUEUED
     queued_jobs, _ = enqueued
-    assert queued_jobs == [job_id]
+    assert queued_jobs == [(job_id, False)]
 
 
 def test_start_refuses_when_nothing_was_uploaded(client, enqueued):

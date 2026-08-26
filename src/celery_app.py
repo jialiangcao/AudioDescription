@@ -67,6 +67,7 @@ app.conf.update(
         "visibility_timeout": 3600,
     },
     task_routes={
+        "tasks.fetch_source": {"queue": QUEUE_MEDIA},
         "tasks.segment": {"queue": QUEUE_MEDIA},
         "tasks.audio": {"queue": QUEUE_MEDIA},
         "tasks.build_timeline": {"queue": QUEUE_MEDIA},

@@ -17,7 +17,9 @@ S3-compatible object storage (Cloudflare R2) for all media. A Next.js frontend (
 provides sign-in, drag-and-drop upload, a frame-by-frame view (every extracted frame with its
 timestamp and its own visual analysis beside it, grouped by shot, with the shot's narration
 underneath), a player for the described video, and the Q&A box.
-There is no CLI entrypoint — the old `src/main.py` was removed in favor of the web server.
+There is no CLI entrypoint for the app itself — the old `src/main.py` was removed in favor of the
+web server. `bench/` is a separate CLI, for offline evaluation only (see below). Video enters
+either by browser upload or by YouTube URL (`src/ingest.py`).
 
 ## Commands
 
@@ -117,11 +119,22 @@ its header, and vision and audio are in the header.
 the local/test path; it calls the same stage functions in one process.
 
 Routes: `POST /api/jobs` (reserve + presigned PUT), `POST /api/jobs/{id}/start` (verify the upload,
-enqueue), `GET /api/jobs` (list), `GET /api/jobs/{id}` (status + timeline with presigned URLs),
+enqueue), `POST /api/jobs/from-url` (queue a job whose source a worker fetches — no `/start`,
+because there is no upload to verify), `GET /api/jobs` (list), `GET /api/jobs/{id}` (status +
+timeline with presigned URLs),
 `POST /api/jobs/{id}/media-urls` (presign a batch of keys — progress events carry keys, and
 `<img>`/`<audio>`/`<video>` cannot send an auth header), `POST /api/jobs/{id}/ws-ticket`,
 `WS /api/jobs/{id}/events?ticket=…&since=…`, `POST /api/jobs/{id}/ask` (queues a run),
 `GET /api/qa/{run_id}`, `/healthz`, `/readyz`.
+
+Stage 0, only for URL sources: **`ingest.py`** — `download_youtube()` (yt-dlp, capped at 720p,
+hosts allowlisted) run by `tasks.fetch_source` on the **media** queue, because yt-dlp muxes the
+video and audio streams with ffmpeg. It writes `source.mp4` into the bucket and then
+`self.replace`s itself with `segment`, so every later stage sees exactly the world an upload would
+have left. yt-dlp is in the `media` extra and imported **lazily**, keeping `tasks.py` importable in
+the slim image. Length, not size, is the gate here (`MAX_SOURCE_DURATION_SEC`): a URL has no byte
+count until it has been fetched. `ADESC_YTDLP_COOKIES_FROM_BROWSER` / `ADESC_YTDLP_COOKIEFILE` feed
+yt-dlp a session, which datacenter IPs eventually need and a laptop does not.
 
 The eight stages, each in its own module under `src/`:
 
@@ -306,6 +319,47 @@ Two images, four Fly apps, one Vercel project.
 
 Migrations run before the deploy and both versions are live during a rolling one, so every
 migration must be backward compatible with the running code.
+
+### Offline evaluation (`bench/`)
+
+A developer-only CLI that scores this pipeline against **CMD-AD**, the dataset from *AutoAD III:
+The Prequel* (arXiv 2404.14412). It lives outside `src/`, is in neither Docker image, and nothing
+under `src/` may import it — it goes the other way, calling the stage functions directly against a
+`JobBlobs(store=None)`. So a run needs **no Postgres, Redis or object storage**; the only
+credential is `GEMINI_API_KEY`.
+
+```bash
+uv sync --extra media --extra bench
+uv run python -m bench fetch --csv data/cmd_ad.csv --limit 3   # pull the clips from YouTube
+uv run python -m bench run   --csv data/cmd_ad.csv             # one AD line per reference row
+uv run python -m bench score                                   # CIDEr + LLM-AD-eval
+```
+
+The CSV's `cmd_filename` is `<year>/<youtube_id>`; `scaled_start`/`scaled_end` are the reference
+AD's window **on that YouTube clip's own timeline** (the paper maps them there from the full
+movie's AudioVault audio with a per-movie `W·t + B` RANSAC fit), and `duration` is the time the
+human describer had to speak in.
+
+`bench/anchored.py` is the design decision worth knowing: rather than letting the pipeline pick its
+own gaps and fuzzy-matching those to the CSV — which would confound "described it well" with
+"spoke at the same moment" — it builds a `Timeline` whose segments **are** the CSV rows, with the row's
+`duration` as `narratable_gap_sec` (hence the same word budget) and the frames sampled around the
+window. `fill_narration_gaps` then runs unmodified and emits exactly one line per reference line.
+
+Per-clip intermediates go through the same `job_state` helpers the Celery tasks use, into
+`data/work/<video_id>/`, so iterating on the narration prompt costs no vision calls the second
+time. `--interval-sec` is the cost dial: stage 2 is one Gemini call per sampled frame.
+
+Metrics live in `bench/metrics.py`. The LLM-AD-eval prompt is the paper's Appendix B.2 listing
+verbatim, but the judge is Gemini rather than `gpt-3.5-turbo`, so absolute values are **not**
+comparable to the paper's table (and a Gemini judge scoring Gemini-written lines self-prefers).
+CIDEr's IDF is estimated over the corpus passed in, so it only compares across runs on the same
+rows — and it is dominated by *register* rather than content: on our own corpus, simply copying the
+neighbouring reference AD line scores 30.4 against our pipeline's 38.2. The published anchors,
+printed in every report: AutoAD-II 13.5 CIDEr, the training-free AutoAD-Zero 17.7, AutoAD-III 25.0,
+and **human inter-rater agreement 69.8 / 3.06** — the actual ceiling. CRITIC and Recall@1/5
+are not implemented; CRITIC needs `fastcoref` plus IMDb cast lists and would score near zero today,
+since the narration prompt never names characters.
 
 ### Dev tools
 This project uses ruff lint and pyright type checking, ensure there are no errors with either of these in the code you write/edit.

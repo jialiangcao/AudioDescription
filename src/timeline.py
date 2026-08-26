@@ -43,8 +43,17 @@ class AudioAnalysis(BaseModel):
 # Minimum speech-free time within a shot for it to be worth narrating.
 MIN_NARRATABLE_GAP_SEC = 2.0
 
-# Standard audio-description pacing, in words per second.
-NARRATION_WORDS_PER_SEC = 2.5
+# Audio-description pacing, in words per second — the narration word budget is
+# this times the gap the line has to fit in.
+#
+# Measured, not assumed: across 134 CMD-AD reference lines the human describers
+# average 3.46 w/s (median 3.72). At the previous 2.5, 82% of reference lines
+# would not have fit the budget we gave ourselves, and our narration came out
+# systematically shorter than the reference whether or not it described the right
+# thing. Raising it to 3.4 moved CIDEr 29.2 -> 41.3 and LLM-AD-eval 1.38 -> 1.66
+# over the same rows (better on 40 pairs, worse on 19, sign test p = 0.004).
+# See `bench/` for the harness that produced those numbers.
+NARRATION_WORDS_PER_SEC = 3.4
 
 
 class Segment(BaseModel):
@@ -105,7 +114,13 @@ def _transcript_within(start, end, transcript_segments):
     return " ".join(texts) if texts else None
 
 
-def _build_audio_analysis(start, end, speech_regions, transcript_segments):
+def build_audio_analysis(start, end, speech_regions, transcript_segments):
+    """The speech picture for one window: does it talk, what is said, how quiet.
+
+    Public because segments are not always shots — the benchmark harness builds
+    them from ground-truth AD windows and needs the same dialogue context the
+    real pipeline gives a narration line.
+    """
     duration = end - start
     speech_sec = _speech_seconds_within(start, end, speech_regions)
     silence_ratio = 1.0 - (speech_sec / duration) if duration > 0 else 1.0
@@ -132,7 +147,7 @@ def build_timeline(
     segments = []
     for shot in shots:
         start, end = shot["start"], shot["end"]
-        audio = _build_audio_analysis(start, end, speech_regions, transcript_segments)
+        audio = build_audio_analysis(start, end, speech_regions, transcript_segments)
         # Narration must fit one uninterrupted silent stretch, so size the gap to
         # the longest contiguous speech-free span — not the total silence, which
         # over-estimates the fit and makes narration overrun (and get cut off).

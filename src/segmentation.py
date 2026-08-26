@@ -144,6 +144,15 @@ def extract_keyframes(video_path, shots, blobs, interval_sec=1.0):
     return shot_records
 
 
-def segment_video(video_path, blobs, threshold=27.0):
+def segment_video(video_path, blobs, threshold=27.0, interval_sec=None):
+    """Detect shots and sample frames within each. ``interval_sec`` is the cost knob.
+
+    Stage 2 issues one Gemini call per sampled frame, so this interval — not the
+    shot count — is what a job's API cost scales with. It is a parameter rather
+    than a constant so the benchmark harness can trade frame density against
+    spend from the command line; ``None`` keeps ``extract_keyframes``' default.
+    """
     shots = detect_shots(video_path, threshold=threshold)
-    return extract_keyframes(video_path, shots, blobs)
+    if interval_sec is None:
+        return extract_keyframes(video_path, shots, blobs)
+    return extract_keyframes(video_path, shots, blobs, interval_sec=interval_sec)

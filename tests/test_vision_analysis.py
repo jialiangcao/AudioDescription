@@ -285,12 +285,17 @@ async def test_fill_narration_gaps_optimizes_when_estimate_exceeds_gap(
     keyframe = "frames/frame.jpg"
     job_blobs.path(keyframe).write_bytes(b"fake-image-bytes")
 
-    # Canned narration is 6 words -> ~2.4s at 2.5 wps, over the 2.0s gap, so the
-    # inline optimization pass should fire.
+    # Canned narration is 6 words -> 2.4s at the 2.5 wps passed here, over the
+    # 2.0s gap, so the inline optimization pass should fire. The rate is explicit
+    # rather than inherited from NARRATION_WORDS_PER_SEC: what is under test is
+    # "overruns the gap -> condense", not whatever the current default happens
+    # to be.
     seg = _segment(0, None, ad_eligible=True, narratable_gap_sec=2.0, keyframe=keyframe)
     tl = Timeline(job_id="v", duration_sec=2.0, segments=[seg])
 
-    result = await fill_narration_gaps(tl, job_blobs, client=fake_gemini_client)
+    result = await fill_narration_gaps(
+        tl, job_blobs, words_per_sec=2.5, client=fake_gemini_client
+    )
 
     assert len(_inline_optimize_calls(fake_gemini_client)) == 1
     # The optimized text replaces the generated line.
@@ -303,7 +308,8 @@ async def test_fill_narration_gaps_skips_optimization_when_line_fits(
     keyframe = "frames/frame.jpg"
     job_blobs.path(keyframe).write_bytes(b"fake-image-bytes")
 
-    # A generous 10s gap easily fits the ~2.4s canned line -> no optimization.
+    # A generous 10s gap easily fits the canned line at any sane rate -> no
+    # optimization.
     seg = _segment(
         0, None, ad_eligible=True, narratable_gap_sec=10.0, keyframe=keyframe
     )

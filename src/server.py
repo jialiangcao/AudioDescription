@@ -31,6 +31,7 @@ import repo
 import tickets
 from auth import current_user, warn_if_insecure
 from blobs import JobBlobs
+from ingest import is_supported_url
 from log_config import configure_logging
 from tasks import answer_question as answer_question_task
 from tasks import enqueue_job
@@ -114,6 +115,10 @@ class CreateJobResponse(BaseModel):
     job_id: str
     upload_url: str
     key: str
+
+
+class CreateJobFromUrlRequest(BaseModel):
+    url: str
 
 
 class MediaUrlsRequest(BaseModel):
@@ -257,6 +262,34 @@ async def create_job(
 
     logger.info("job %s: reserved for %s (%s)", job.id, user_id, body.filename)
     return CreateJobResponse(job_id=job.id, upload_url=upload_url, key=source_key)
+
+
+@app.post("/api/jobs/from-url", status_code=202)
+async def create_job_from_url(
+    body: CreateJobFromUrlRequest, user_id: str = Depends(current_user)
+) -> dict:
+    """Reserve a job whose source a worker will fetch, and queue it immediately.
+
+    Deliberately has no matching ``/start``: that route exists to verify an
+    upload landed in the bucket, and here there is no upload to verify. The
+    length limit lives in ``tasks.fetch_source``, which is the first code that
+    knows how long the video is.
+    """
+    if await repo.at_capacity(user_id):
+        raise HTTPException(
+            status_code=429,
+            detail=f"you already have {repo.MAX_ACTIVE_JOBS_PER_USER} jobs in flight",
+        )
+
+    url = body.url.strip()
+    if not is_supported_url(url):
+        raise HTTPException(status_code=400, detail="only YouTube URLs can be fetched")
+
+    job = await repo.create_job(user_id, url, "source.mp4", source_url=url)
+    await repo.set_status(job.id, repo.STATUS_QUEUED)
+    enqueue_job(job.id, from_url=True)
+    logger.info("job %s: queued from URL for %s (%s)", job.id, user_id, url)
+    return {"job_id": job.id, "status": repo.STATUS_QUEUED}
 
 
 @app.post("/api/jobs/{job_id}/start", status_code=202)

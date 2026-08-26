@@ -49,6 +49,8 @@ class Job:
     error: str | None
     filename: str | None
     source_key: str | None
+    # Set only for jobs whose source is fetched by a worker instead of uploaded.
+    source_url: str | None
     duration_sec: float | None
     created_at: datetime
     updated_at: datetime
@@ -63,6 +65,7 @@ class Job:
             error=row["error"],
             filename=row["filename"],
             source_key=row["source_key"],
+            source_url=row["source_url"],
             duration_sec=row["duration_sec"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -70,8 +73,8 @@ class Job:
 
 
 _JOB_COLUMNS = (
-    "id, owner_id, status, stage, error, filename, source_key, duration_sec, "
-    "created_at, updated_at"
+    "id, owner_id, status, stage, error, filename, source_key, source_url, "
+    "duration_sec, created_at, updated_at"
 )
 
 
@@ -80,17 +83,23 @@ _JOB_COLUMNS = (
 # --------------------------------------------------------------------------- #
 
 
-async def create_job(owner_id: str, filename: str | None, source_key: str) -> Job:
+async def create_job(
+    owner_id: str,
+    filename: str | None,
+    source_key: str,
+    source_url: str | None = None,
+) -> Job:
     pool = await get_pool()
     row = await pool.fetchrow(
         f"""
-        insert into jobs (owner_id, status, filename, source_key)
-        values ($1, '{STATUS_CREATED}', $2, $3)
+        insert into jobs (owner_id, status, filename, source_key, source_url)
+        values ($1, '{STATUS_CREATED}', $2, $3, $4)
         returning {_JOB_COLUMNS}
         """,
         uuid.UUID(owner_id),
         filename,
         source_key,
+        source_url,
     )
     logger.info("job %s created for owner %s", row["id"], owner_id)
     return Job.from_row(row)
@@ -168,6 +177,16 @@ async def set_stage(job_id: str, stage: str) -> None:
         "update jobs set stage = $2, heartbeat_at = now() where id = $1",
         uuid.UUID(job_id),
         stage,
+    )
+
+
+async def set_filename(job_id: str, filename: str) -> None:
+    """Name a job after its fetched video, so a URL job reads like an upload."""
+    pool = await get_pool()
+    await pool.execute(
+        "update jobs set filename = $2 where id = $1",
+        uuid.UUID(job_id),
+        filename,
     )
 
 

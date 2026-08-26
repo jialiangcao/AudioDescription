@@ -179,6 +179,22 @@ export async function uploadVideo(
   return job.job_id;
 }
 
+/**
+ * Queue a job from a YouTube URL. A worker downloads the video itself.
+ *
+ * There is no `/start` call to follow: that step exists to confirm an upload
+ * landed in the bucket, and there is no upload here — the job is queued the
+ * moment it is created.
+ */
+export async function submitVideoUrl(url: string): Promise<string> {
+  const job = await request<{ job_id: string }>("/api/jobs/from-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  return job.job_id;
+}
+
 /** XHR rather than fetch, because fetch cannot report upload progress. */
 function putWithProgress(
   url: string,

@@ -7,6 +7,7 @@ import {
   getJob,
   getQaRun,
   mediaUrls,
+  submitVideoUrl,
   uploadVideo,
   type Frame,
   type JobStatus,
@@ -88,6 +89,7 @@ export default function Home() {
   const [described, setDescribed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [urlInput, setUrlInput] = useState("");
 
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<QaRun | null>(null);
@@ -100,7 +102,10 @@ export default function Home() {
   // Last event sequence applied, so a reconnect resumes instead of replaying.
   const lastSeq = useRef(0);
 
-  const startJob = useCallback(async (file: File) => {
+  // Both entry points clear the same state; only the preview differs. A local
+  // file can be played immediately from a blob URL, whereas a fetched one does
+  // not exist on this machine at all until the described video comes back.
+  const resetForNewJob = useCallback((preview: string | null) => {
     setError(null);
     setAnswer(null);
     setSegments({});
@@ -109,23 +114,45 @@ export default function Home() {
     setStatus(null);
     setVideoUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
-      return URL.createObjectURL(file);
+      return preview;
     });
     setUrls({});
     lastSeq.current = 0;
-    try {
-      setUploadPct(0);
-      const id = await uploadVideo(file, (fraction) =>
-        setUploadPct(Math.round(fraction * 100)),
-      );
-      setUploadPct(null);
-      setJobId(id);
-      setStatus("queued");
-    } catch (e) {
-      setUploadPct(null);
-      setError(e instanceof Error ? e.message : String(e));
-    }
   }, []);
+
+  const startJob = useCallback(
+    async (file: File) => {
+      resetForNewJob(URL.createObjectURL(file));
+      try {
+        setUploadPct(0);
+        const id = await uploadVideo(file, (fraction) =>
+          setUploadPct(Math.round(fraction * 100)),
+        );
+        setUploadPct(null);
+        setJobId(id);
+        setStatus("queued");
+      } catch (e) {
+        setUploadPct(null);
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [resetForNewJob],
+  );
+
+  const startJobFromUrl = useCallback(
+    async (url: string) => {
+      resetForNewJob(null);
+      try {
+        const id = await submitVideoUrl(url);
+        setUrlInput("");
+        setJobId(id);
+        setStatus("queued");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [resetForNewJob],
+  );
 
   // Stream live pipeline events while a job is active, reconnecting on drop and
   // resuming from the last sequence seen rather than replaying the whole log.
@@ -366,8 +393,8 @@ export default function Home() {
     <main className="container">
       <h1>Audio Description</h1>
       <p className="subtitle">
-        Drop a video to generate audio-description narration, then ask questions
-        about it.
+        Drop a video — or paste a YouTube link — to generate audio-description
+        narration, then ask questions about it.
       </p>
 
       <div
@@ -394,6 +421,29 @@ export default function Home() {
           }}
         />
       </div>
+
+      <form
+        className="urlbar"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const url = urlInput.trim();
+          if (url) startJobFromUrl(url);
+        }}
+      >
+        <input
+          type="url"
+          placeholder="…or paste a YouTube URL"
+          value={urlInput}
+          onChange={(e) => setUrlInput(e.target.value)}
+        />
+        <button type="submit" disabled={!urlInput.trim()}>
+          Fetch
+        </button>
+      </form>
+      <p className="hint">
+        Fetching a third-party video is your responsibility under YouTube&rsquo;s
+        terms of service.
+      </p>
 
       {error && <div className="error">{error}</div>}
 

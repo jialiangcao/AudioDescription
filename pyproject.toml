@@ -41,6 +41,15 @@ media = [
     "torchaudio>=2.11.0",
     "torchcodec>=0.15.0",
     "torchvision>=0.28.0",
+    "yt-dlp>=2026.1.26",
+]
+
+# The offline CMD-AD benchmark harness (bench/). Never imported by src/, and in
+# neither Docker image — it runs on a developer's machine, against local files.
+bench = [
+    "bert-score>=0.3.13",
+    "pycocoevalcap>=1.2",
+    "yt-dlp>=2026.1.26",
 ]
 
 # PyPI's torch wheels are the CUDA build: ~5GB of NVIDIA libraries that no
@@ -98,6 +107,7 @@ venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "src" for the flat-import convention; "." so the bench/ harness is importable.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 asyncio_mode = "auto"

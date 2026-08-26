@@ -36,6 +36,7 @@ import repo
 from audio_extract import AUDIO_KEY, NoAudioStreamError, extract_audio
 from blobs import JobBlobs
 from celery_app import app
+from ingest import IngestError, download_youtube, probe_youtube
 from mux import DESCRIBED_KEY, mux_described_video
 from pipeline import frame_event, shots_event
 from segmentation import probe_video, segment_video
@@ -57,6 +58,12 @@ logger = logging.getLogger(__name__)
 RETRY_EXCEPTIONS = (OSError, ConnectionError, TimeoutError)
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 10
+
+# Longest video fetch_source will pull. The upload path caps *bytes* at /start,
+# but a URL has no size until it has been downloaded — so length is the only
+# thing that can be checked before paying for it. Vision cost scales with
+# duration too, which is the more expensive reason for a ceiling.
+MAX_SOURCE_DURATION_SEC = 30 * 60
 
 
 def _blobs(job_id: str) -> JobBlobs:
@@ -158,9 +165,84 @@ def _run_stage(task, job_id: str, body):
 # --------------------------------------------------------------------------- #
 
 
-def enqueue_job(job_id: str) -> None:
-    """Kick off the canvas for a job whose source video is already uploaded."""
-    segment.apply_async(args=[job_id])
+def enqueue_job(job_id: str, from_url: bool = False) -> None:
+    """Kick off the canvas for a job.
+
+    A job whose source was uploaded starts at segmentation; one created from a
+    URL starts one stage earlier, at ``fetch_source``, which puts the video in
+    the bucket so every later stage sees the same world either way.
+    """
+    if from_url:
+        fetch_source.apply_async(args=[job_id])
+    else:
+        segment.apply_async(args=[job_id])
+
+
+# --------------------------------------------------------------------------- #
+# stage 0: fetch (URL sources only)
+# --------------------------------------------------------------------------- #
+
+
+@app.task(
+    name="tasks.fetch_source",
+    bind=True,
+    autoretry_for=RETRY_EXCEPTIONS,
+    max_retries=MAX_RETRIES,
+    retry_backoff=RETRY_BACKOFF_SEC,
+    retry_jitter=True,
+)
+def fetch_source(self, job_id: str):
+    """Download a job's source video from its URL, then hand off to segmentation.
+
+    On the media queue because yt-dlp muxes the video and audio streams with
+    ffmpeg, which only that image carries.
+    """
+    blobs = _blobs(job_id)
+
+    async def _body():
+        job = await repo.get_job(job_id)
+        if job is None or job.source_url is None:
+            raise RuntimeError(f"job {job_id} has no source URL")
+
+        await repo.set_status(job_id, repo.STATUS_PROCESSING)
+        await repo.set_stage(job_id, "fetch")
+        await _emit(job_id, {"type": "stage", "stage": "fetch", "status": "start"})
+
+        meta = await asyncio.to_thread(probe_youtube, job.source_url)
+        duration = meta.get("duration_sec")
+        if duration is not None and duration > MAX_SOURCE_DURATION_SEC:
+            raise IngestError(
+                f"video is {duration / 60:.0f} minutes; the limit is "
+                f"{MAX_SOURCE_DURATION_SEC // 60}"
+            )
+
+        source_key = job.source_key or "source.mp4"
+        info = await asyncio.to_thread(
+            download_youtube, job.source_url, blobs.path(source_key)
+        )
+        blobs.put(source_key)
+        # Prefer what the download reported over what the probe guessed: they
+        # agree in practice, and only the former saw the file that landed.
+        title = info.get("title") or meta.get("title")
+        if title:
+            await repo.set_filename(job_id, title)
+
+        await _emit(
+            job_id,
+            {
+                "type": "stage",
+                "stage": "fetch",
+                "status": "done",
+                "title": meta.get("title"),
+                "duration_sec": duration,
+            },
+        )
+        logger.info("job %s: fetched %s", job_id, job.source_url)
+
+    _run_stage(self, job_id, _body)
+    # Not a chain: the canvas below is built by segment itself via self.replace,
+    # and replacing this task with segment keeps that one entry point.
+    self.replace(segment.si(job_id))
 
 
 # --------------------------------------------------------------------------- #
