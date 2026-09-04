@@ -33,6 +33,25 @@ class FakeStore:
     def generate_presigned_url(self, op, Params, ExpiresIn):  # noqa: N803
         return f"https://bucket.example/{Params['Key']}?op={op}&ttl={ExpiresIn}"
 
+    def get_paginator(self, op):
+        store = self
+
+        class _Paginator:
+            def paginate(self, Bucket, Prefix):  # noqa: N803
+                yield {
+                    "Contents": [
+                        {"Key": key}
+                        for key in sorted(store.objects)
+                        if key.startswith(Prefix)
+                    ]
+                }
+
+        return _Paginator()
+
+    def delete_objects(self, Bucket, Delete):  # noqa: N803
+        for obj in Delete["Objects"]:
+            self.objects.pop(obj["Key"], None)
+
 
 @pytest.fixture
 def bucket_env(monkeypatch):
@@ -141,3 +160,30 @@ def test_presigned_urls_address_the_namespaced_key(tmp_path, bucket_env):
 
     assert "jobs/job-1/frames/a.jpg" in blobs.presign_get("frames/a.jpg", ttl_sec=60)
     assert "op=put_object" in blobs.presign_put("source.mp4")
+
+
+def test_delete_all_clears_the_bucket_prefix_and_scratch(tmp_path, bucket_env):
+    """Deleting a job must not leave another job's objects behind."""
+    store = FakeStore(
+        {
+            "jobs/job-1/frames/a.jpg": b"a",
+            "jobs/job-1/narration/shot_0000.wav": b"b",
+            "jobs/job-2/frames/a.jpg": b"someone else's",
+        }
+    )
+    blobs = JobBlobs("job-1", root=tmp_path, store=store)
+    blobs.path("frames/a.jpg").write_bytes(b"a")
+
+    removed = blobs.delete_all()
+
+    assert removed == 2
+    assert set(store.objects) == {"jobs/job-2/frames/a.jpg"}
+    assert not tmp_path.exists()
+
+
+def test_delete_all_without_a_bucket_only_clears_scratch(tmp_path):
+    blobs = JobBlobs("job-1", root=tmp_path)
+    blobs.path("frames/a.jpg").write_bytes(b"a")
+
+    assert blobs.delete_all() == 0
+    assert not tmp_path.exists()

@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 # Awaited with (node_name, records_appended) as each graph node completes.
 StepCallback = Callable[[str, list[dict]], Awaitable[None]]
+# Awaited with the planner's decision the moment it is made — i.e. *before* the
+# agent it names has run. `on_step` can only report a step once it has finished,
+# and a worker agent runs for tens of seconds, so this is what lets a caller say
+# what the run is doing right now rather than what it last did.
+DecisionCallback = Callable[[dict], Awaitable[None]]
 
 NOT_CREDIBLE_ACTION = (
     "Upon reflection, your current answer is not reliable. Please reconsider "
@@ -291,13 +296,22 @@ class QASystem:
 
     # -- entry point ---------------------------------------------------------
 
-    async def run(self, on_step: StepCallback | None = None) -> QAResult:
+    async def run(
+        self,
+        on_step: StepCallback | None = None,
+        on_decision: DecisionCallback | None = None,
+    ) -> QAResult:
         """Run the graph to completion.
 
         ``on_step`` (if given) is awaited with each node's name and the records
         it just appended, as they happen — which is the point of the graph:
         the browser can watch the reasoning trace build instead of waiting
         minutes for the finished answer.
+
+        ``on_decision`` is awaited with each planner decision as soon as it is
+        made, which is the *only* forward-looking signal in the run: it names
+        the agent about to spend the next tens of seconds working, where
+        ``on_step`` can only report that agent once it has already finished.
         """
         initial: QAState = {
             "history": [],
@@ -314,10 +328,10 @@ class QASystem:
         graph = self.build_graph()
         config: RunnableConfig = {"recursion_limit": self.max_cycles * 4 + 10}
 
-        if on_step is None:
+        if on_step is None and on_decision is None:
             final = await graph.ainvoke(initial, config=config)
         else:
-            final = await self._stream(graph, initial, config, on_step)
+            final = await self._stream(graph, initial, config, on_step, on_decision)
 
         if final["completed"]:
             return self._build_final_result(
@@ -325,7 +339,14 @@ class QASystem:
             )
         return self._build_final_result(final, "failed", "Exceeded maximum cycles.")
 
-    async def _stream(self, graph, initial, config, on_step: StepCallback) -> QAState:
+    async def _stream(
+        self,
+        graph,
+        initial,
+        config,
+        on_step: StepCallback | None,
+        on_decision: DecisionCallback | None = None,
+    ) -> QAState:
         """Run the graph, reporting each node's updates, and rebuild the state.
 
         ``stream_mode="updates"`` yields only what each node returned, so the
@@ -342,7 +363,11 @@ class QASystem:
                         state["history"] = state["history"] + value
                     else:
                         state[key] = value  # type: ignore[literal-required]
-                await on_step(node, update.get("history", []))
+                if on_step is not None:
+                    await on_step(node, update.get("history", []))
+                # After the planner, and only then, the next agent is known.
+                if on_decision is not None and node == "plan" and state["decision"]:
+                    await on_decision(state["decision"])
         return state
 
     def _build_final_result(
@@ -358,12 +383,14 @@ class QASystem:
 
 
 async def answer_question(
-    timeline: Timeline, question: str, client, blobs, on_step=None
+    timeline: Timeline, question: str, client, blobs, on_step=None, on_decision=None
 ) -> QAResult:
     """Answer a free-form question about a processed video's timeline.
 
     ``on_step`` (optional) is awaited with each agent step as it completes, so
     a caller can stream the reasoning trace rather than wait for the answer.
+    ``on_decision`` (optional) is awaited with each planner decision as it is
+    made, naming the agent that is *about* to run.
     """
     logger.info(
         "answer_question: question=%r over %d segment(s)",
@@ -371,7 +398,7 @@ async def answer_question(
         len(timeline.segments),
     )
     system = QASystem(timeline=timeline, question=question, client=client, blobs=blobs)
-    result = await system.run(on_step=on_step)
+    result = await system.run(on_step=on_step, on_decision=on_decision)
     logger.info(
         "answer_question: status=%s cycles=%d answer=%r",
         result.status,

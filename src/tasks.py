@@ -151,6 +151,12 @@ def _run_stage(task, job_id: str, body):
                 exc,
             )
             raise
+        # A job its owner deleted mid-stage fails on its next write — the event
+        # log is gone, and so is the row a status would be reported on. That is
+        # an ordinary end, not an error worth alarming about.
+        if not _run(repo.job_exists(job_id)):
+            logger.info("job %s: deleted while %s ran, abandoning", job_id, task.name)
+            return None
         logger.error("job %s: stage %s failed: %r", job_id, task.name, exc)
         _run(
             repo.set_status(
@@ -302,6 +308,10 @@ def segment(self, job_id: str):
         return shots
 
     shots = _run_stage(self, job_id, _body)
+    if shots is None:
+        # The job was deleted while segmentation ran; there is nothing left to
+        # fan out to.
+        return None
 
     # Vision fans out one task per shot — the largest unit a single task can own
     # end to end, so no two tasks ever write the same vision blob. Audio joins
@@ -685,22 +695,46 @@ def answer_question(self, run_id: str, job_id: str):
 
             A run is up to 17 planner cycles, so this is the difference between
             a trace panel that fills in live and one that appears all at once
-            several minutes later.
+            several minutes later. Nodes with no records — the planner — are
+            published too: they carry no trace entry, but they are still a
+            step the browser can name.
             """
-            if records:
-                await _emit(
-                    job_id,
-                    {
-                        "type": "qa_trace",
-                        "run_id": run_id,
-                        "node": node,
-                        "records": records,
-                    },
-                )
+            await _emit(
+                job_id,
+                {
+                    "type": "qa_trace",
+                    "run_id": run_id,
+                    "node": node,
+                    "records": records,
+                },
+            )
+
+        async def _on_decision(decision: dict) -> None:
+            """Name the agent that is about to run.
+
+            The only forward-looking signal in a run: a worker agent takes tens
+            of seconds, so without this the panel would show the *previous*
+            step for the whole time the current one is working.
+            """
+            await _emit(
+                job_id,
+                {
+                    "type": "qa_step",
+                    "run_id": run_id,
+                    "agent": decision.get("agent"),
+                    "reason": decision.get("reason"),
+                    "instruct": decision.get("instruct"),
+                },
+            )
 
         try:
             result = await qa.answer_question(
-                timeline, run["question"], _gemini_client(), blobs, on_step=_on_step
+                timeline,
+                run["question"],
+                _gemini_client(),
+                blobs,
+                on_step=_on_step,
+                on_decision=_on_decision,
             )
         except Exception as exc:  # noqa: BLE001 - recorded on the run, not raised
             logger.exception("qa run %s failed", run_id)

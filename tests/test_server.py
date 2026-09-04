@@ -58,6 +58,8 @@ class FakeBlobs:
     """A JobBlobs whose presigning and size checks are deterministic."""
 
     uploaded_size: int | None = 1024
+    # Job ids whose blobs were swept, so a delete can be checked end to end.
+    deleted: list[str] = []
 
     def __init__(self, job_id):
         self.job_id = job_id
@@ -70,6 +72,10 @@ class FakeBlobs:
 
     def size(self, key):
         return type(self).uploaded_size
+
+    def delete_all(self):
+        type(self).deleted.append(self.job_id)
+        return 0
 
 
 @pytest.fixture
@@ -99,6 +105,7 @@ def client(db, owner, monkeypatch, enqueued):
         server.JobBlobs, "remote", classmethod(lambda cls, job_id: FakeBlobs(job_id))
     )
     FakeBlobs.uploaded_size = 1024
+    FakeBlobs.deleted = []
     with TestClient(server.app) as test_client:
         yield test_client
 
@@ -380,6 +387,47 @@ async def test_list_jobs_returns_only_this_users_jobs(client, db, owner):
 
     assert len(jobs) == 1
     assert jobs[0]["filename"] == "clip.mp4"
+
+
+async def test_delete_job_takes_its_media_and_every_derived_row(
+    client, owner, db, enqueued
+):
+    job = await _job(owner, repo.STATUS_DONE)
+    await repo.save_timeline(job.id, _timeline(job.id))
+    run_id = await repo.create_qa_run(job.id, owner, "what colour?")
+
+    assert client.delete(f"/api/jobs/{job.id}").status_code == 204
+
+    assert FakeBlobs.deleted == [job.id]
+    assert client.get(f"/api/jobs/{job.id}").status_code == 404
+    assert client.get("/api/jobs").json()["jobs"] == []
+    # job_events, timelines and qa_runs all cascade off the job row.
+    assert await repo.get_timeline(job.id) is None
+    assert await repo.events_since(job.id) == []
+    assert (
+        await db.fetchval(
+            "select count(*) from qa_runs where id = $1", uuid.UUID(run_id)
+        )
+        == 0
+    )
+
+
+async def test_deleting_a_job_that_is_still_running_is_allowed(client, owner):
+    """A stuck job must be removable without waiting for it to finish."""
+    job = await _job(owner, repo.STATUS_PROCESSING)
+
+    assert client.delete(f"/api/jobs/{job.id}").status_code == 204
+    assert await repo.get_job(job.id) is None
+
+
+async def test_another_users_job_cannot_be_deleted(client, db):
+    other = str(uuid.uuid4())
+    await db.execute("insert into auth.users (id) values ($1)", uuid.UUID(other))
+    theirs = await repo.create_job(other, "theirs.mp4", "source.mp4")
+
+    assert client.delete(f"/api/jobs/{theirs.id}").status_code == 404
+    assert FakeBlobs.deleted == []
+    assert await repo.get_job(theirs.id) is not None
 
 
 # --------------------------------------------------------------------------- #

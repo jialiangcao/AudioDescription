@@ -1,8 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { authEnabled, supabase } from "../lib/supabase";
+
+/** Who is signed in, for the header's account menu. Null when auth is off. */
+const AccountContext = createContext<{ email: string | null }>({ email: null });
+
+export function useAccount() {
+  return useContext(AccountContext);
+}
+
+/** Ends the session. Safe to call when auth isn't configured — it does nothing. */
+export async function signOut() {
+  if (!authEnabled) return;
+  await supabase().auth.signOut();
+}
 
 /**
  * Gates the app behind a Supabase session.
@@ -32,56 +45,76 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     return () => subscription.subscription.unsubscribe();
   }, []);
 
-  if (!authEnabled) return <>{children}</>;
-  if (!ready) return <main className="container">Loading…</main>;
+  if (!authEnabled) {
+    return (
+      <AccountContext.Provider value={{ email: null }}>
+        {children}
+      </AccountContext.Provider>
+    );
+  }
+
+  if (!ready) {
+    return (
+      <div className="gate">
+        <p className="gate-loading">Getting things ready…</p>
+      </div>
+    );
+  }
 
   if (!session) {
     return (
-      <main className="container">
-        <h1>Audio Description</h1>
-        <p className="subtitle">Sign in to generate audio description.</p>
-        {sent ? (
-          <p>Check your email for a sign-in link.</p>
-        ) : (
-          <form
-            className="ask-row"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setError(null);
-              // Send the link back to whichever deployment the user is on.
-              // Without this, Supabase uses the project's single Site URL, so
-              // signing in from a preview deploy would land on production.
-              const { error: signInError } =
-                await supabase().auth.signInWithOtp({
-                  email,
-                  options: { emailRedirectTo: window.location.origin },
-                });
-              if (signInError) setError(signInError.message);
-              else setSent(true);
-            }}
-          >
-            <input
-              type="email"
-              required
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            <button type="submit">Send sign-in link</button>
-          </form>
-        )}
-        {error && <div className="error">{error}</div>}
-      </main>
+      <div className="gate">
+        <div className="gate-card">
+          <p className="wordmark gate-mark">BuddyWatch</p>
+          <h1 className="gate-title">Audio description for any video</h1>
+          <p className="gate-copy">
+            Sign in and we&rsquo;ll email you a link — no password to remember.
+          </p>
+          {sent ? (
+            <p className="gate-sent">
+              Link sent. Check <strong>{email}</strong> and open it on this
+              device.
+            </p>
+          ) : (
+            <form
+              className="gate-form"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setError(null);
+                // Send the link back to whichever deployment the user is on.
+                // Without this, Supabase uses the project's single Site URL, so
+                // signing in from a preview deploy would land on production.
+                const { error: signInError } =
+                  await supabase().auth.signInWithOtp({
+                    email,
+                    options: { emailRedirectTo: window.location.origin },
+                  });
+                if (signInError) setError(signInError.message);
+                else setSent(true);
+              }}
+            >
+              <input
+                type="email"
+                required
+                placeholder="you@example.com"
+                aria-label="Email address"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+              <button type="submit" className="btn-primary">
+                Email me a link
+              </button>
+            </form>
+          )}
+          {error && <p className="notice notice-error">{error}</p>}
+        </div>
+      </div>
     );
   }
 
   return (
-    <>
-      <div className="auth-bar">
-        <span>{session.user.email}</span>
-        <button onClick={() => supabase().auth.signOut()}>Sign out</button>
-      </div>
+    <AccountContext.Provider value={{ email: session.user.email ?? null }}>
       {children}
-    </>
+    </AccountContext.Provider>
   );
 }

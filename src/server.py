@@ -23,6 +23,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 import db
@@ -331,6 +332,31 @@ async def list_jobs(user_id: str = Depends(current_user)) -> dict:
             for job in jobs
         ]
     }
+
+
+@app.delete("/api/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: str, user_id: str = Depends(current_user)) -> Response:
+    """Erase a job: its media, its event log, its timeline and its Q&A runs.
+
+    Media goes first. If the row went first and the bucket sweep then failed,
+    nothing would ever name those objects again; this way a failure leaves a
+    job that is still listed and can be deleted again. Orphans are survivable
+    either way — the lifecycle rule on ``jobs/*`` expires them — but a visible
+    job is recoverable and an invisible one is not.
+
+    A job that is still running can be deleted too. Its worker cannot be
+    called back mid-stage, so it may write a few more blobs before its next
+    database call finds the job gone and stops it; those are left to the
+    lifecycle rule rather than blocking the delete behind a stage that may
+    have minutes to run.
+    """
+    await _require_job(job_id, user_id)
+    try:
+        JobBlobs.remote(job_id).delete_all()
+    except Exception:  # noqa: BLE001 - the row must go regardless
+        logger.exception("job %s: could not delete its blobs", job_id)
+    await repo.delete_job(job_id, user_id)
+    return Response(status_code=204)
 
 
 @app.post("/api/jobs/{job_id}/media-urls")

@@ -136,6 +136,37 @@ async def list_jobs(owner_id: str, limit: int = 50) -> list[Job]:
     return [Job.from_row(row) for row in rows]
 
 
+async def delete_job(job_id: str, owner_id: str) -> bool:
+    """Erase a job and everything hanging off it. False if it wasn't theirs.
+
+    ``job_events``, ``timelines`` and ``qa_runs`` all reference ``jobs`` with
+    ``on delete cascade``, so this one statement takes the event log, the
+    timeline and every Q&A run with it. Blob storage is not the database's to
+    clean up — the caller does that (see ``JobBlobs.delete_all``).
+    """
+    pool = await get_pool()
+    deleted = await pool.fetchval(
+        "delete from jobs where id = $1 and owner_id = $2 returning id",
+        uuid.UUID(job_id),
+        uuid.UUID(owner_id),
+    )
+    if deleted is not None:
+        logger.info("job %s deleted by owner %s", job_id, owner_id)
+    return deleted is not None
+
+
+async def job_exists(job_id: str) -> bool:
+    """Whether a job is still around — false once its owner has deleted it.
+
+    Workers check this before reporting a failure, so a job deleted mid-flight
+    ends quietly instead of as an error nobody will ever read.
+    """
+    pool = await get_pool()
+    return (
+        await pool.fetchval("select 1 from jobs where id = $1", uuid.UUID(job_id))
+    ) is not None
+
+
 async def active_count(owner_id: str) -> int:
     pool = await get_pool()
     return await pool.fetchval(

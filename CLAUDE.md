@@ -121,7 +121,9 @@ the local/test path; it calls the same stage functions in one process.
 Routes: `POST /api/jobs` (reserve + presigned PUT), `POST /api/jobs/{id}/start` (verify the upload,
 enqueue), `POST /api/jobs/from-url` (queue a job whose source a worker fetches — no `/start`,
 because there is no upload to verify), `GET /api/jobs` (list), `GET /api/jobs/{id}` (status +
-timeline with presigned URLs),
+timeline with presigned URLs), `DELETE /api/jobs/{id}` (sweep the job's bucket prefix, then
+delete the row — `job_events`, `timelines` and `qa_runs` cascade off it; allowed mid-run, so a
+worker may write a few more blobs before its next database call finds the job gone and stops),
 `POST /api/jobs/{id}/media-urls` (presign a batch of keys — progress events carry keys, and
 `<img>`/`<audio>`/`<video>` cannot send an auth header), `POST /api/jobs/{id}/ws-ticket`,
 `WS /api/jobs/{id}/events?ticket=…&since=…`, `POST /api/jobs/{id}/ask` (queues a run),

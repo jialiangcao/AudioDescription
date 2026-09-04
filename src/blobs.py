@@ -162,6 +162,36 @@ class JobBlobs:
             return None
         return head["ContentLength"]
 
+    def delete_all(self) -> int:
+        """Remove every object this job owns, in the bucket and in scratch.
+
+        Deleting a job has to take its media with it — the R2 lifecycle rule on
+        ``jobs/*`` expires artifacts eventually, but a user who deletes a video
+        means now. Returns the number of objects removed from the bucket.
+
+        The listing is paginated because a long video's frames run to thousands
+        of keys, and ``delete_objects`` takes at most 1000 at a time.
+        """
+        import shutil
+
+        shutil.rmtree(self.root, ignore_errors=True)
+        if self._store is None:
+            return 0
+
+        prefix = f"jobs/{self.job_id}/"
+        removed = 0
+        paginator = self._store.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name(), Prefix=prefix):
+            batch = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+            if not batch:
+                continue
+            self._store.delete_objects(
+                Bucket=bucket_name(), Delete={"Objects": batch, "Quiet": True}
+            )
+            removed += len(batch)
+        logger.info("blobs: deleted %d object(s) under %s", removed, prefix)
+        return removed
+
     # -- presigning ----------------------------------------------------------
 
     def presign_get(self, key: str, ttl_sec: int = DEFAULT_PRESIGN_TTL_SEC) -> str:

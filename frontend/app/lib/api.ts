@@ -84,12 +84,7 @@ export interface Timeline {
 }
 
 export type JobStatus =
-  | "created"
-  | "queued"
-  | "processing"
-  | "done"
-  | "error"
-  | "interrupted";
+  "created" | "queued" | "processing" | "done" | "error" | "interrupted";
 
 export interface JobDetail {
   id: string;
@@ -133,6 +128,9 @@ export type PipelineEvent = (
   | { type: "ad_track"; audio: string; duration_sec: number | null }
   | { type: "described_video"; video: string }
   | { type: "qa_status"; run_id: string; status: string }
+  // One graph node finished. `node` is what the run is doing right now, which
+  // is the only progress signal a question has while it is still being worked.
+  | { type: "qa_trace"; run_id: string; node: string; records: TraceEntry[] }
   | {
       type: "qa_result";
       run_id: string;
@@ -310,4 +308,38 @@ export async function mediaUrls(
     },
   );
   return urls;
+}
+
+/** One row of the job history: enough to list a job without its timeline. */
+export interface JobSummary {
+  id: string;
+  status: JobStatus;
+  stage: string | null;
+  filename: string | null;
+  duration_sec: number | null;
+  created_at: string;
+}
+
+/** This user's jobs, newest first — finished and in-flight alike. */
+export async function listJobs(): Promise<JobSummary[]> {
+  const { jobs } = await request<{ jobs: JobSummary[] }>("/api/jobs");
+  return jobs;
+}
+
+/**
+ * Delete a job: its media, its event log, its timeline and its Q&A runs.
+ *
+ * Irreversible, so callers should confirm first.
+ */
+export async function deleteJob(jobId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/api/jobs/${jobId}`, {
+    method: "DELETE",
+    headers: await authHeaders(),
+  });
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({}));
+    throw new Error(
+      detail.detail ?? `could not delete the video (${resp.status})`,
+    );
+  }
 }

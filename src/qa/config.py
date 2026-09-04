@@ -5,7 +5,25 @@ implementation this package ports; the rest adapt it to Gemini and to this
 codebase (see qaPLAN.md / CLAUDE.md).
 """
 
+import os
+
 from google.genai import types
+
+
+def _int(name: str, default: int) -> int:
+    """An override from the environment, for tuning without a code change.
+
+    The latency profile of this system is dominated by two of these — the frame
+    count per vision call and the cycle budget — and both are workload-specific,
+    so they need to be adjustable per deployment rather than baked in.
+    """
+    return int(os.environ.get(name, default))
+
+
+def _thinking(name: str, default: types.ThinkingLevel) -> types.ThinkingLevel:
+    value = os.environ.get(name)
+    return getattr(types.ThinkingLevel, value.upper()) if value else default
+
 
 # One model for the text (planner/agent) layer and one for the frame-consuming
 # vision calls. Both are Gemini per project policy; kept as separate constants
@@ -17,7 +35,7 @@ VISION_MODEL = "gemini-3.5-flash"
 # DeepSeek-R1 reasoning seats, so they get HIGH; the worker agents are
 # routing/extraction and the vision tools are perceptual — HIGH tends to
 # over-condense those (see vision_analysis.py), so they stay LOW.
-THINKING_PLANNER = types.ThinkingLevel.HIGH
+THINKING_PLANNER = _thinking("QA_THINKING_PLANNER", types.ThinkingLevel.HIGH)
 THINKING_AGENT = types.ThinkingLevel.LOW
 THINKING_VISION = types.ThinkingLevel.LOW
 
@@ -28,10 +46,10 @@ TEXT_MAX_OUTPUT_TOKENS = 4096
 VISION_MAX_OUTPUT_TOKENS = 1024
 
 # Orchestrator cycle budget. (Symphony)
-MAX_CYCLES = 17
+MAX_CYCLES = _int("QA_MAX_CYCLES", 17)
 
 # PerceptionAgent ReAct iterations; the last one force-requests an answer. (Symphony)
-PERCEPTION_MAX_ITERATIONS = 6
+PERCEPTION_MAX_ITERATIONS = _int("QA_PERCEPTION_MAX_ITERATIONS", 6)
 
 # How often Localize/Perception re-sample the model when it returns neither an
 # answer nor a tool call. (Symphony)
@@ -50,9 +68,11 @@ LOCALIZE_CONCURRENCY = 8
 
 # Frame-selection sizes, all Symphony values.
 RETRIEVE_TOP_K = 15
-INSPECT_UNIFORM_MAX = 70
-INSPECT_RETRIEVE_TOP_K = 20
-SUMMARY_FRAME_COUNT = 30
+# Measured: a vision call costs ~3.6s at 20 frames, ~7.1s at 40, ~17.8s at 70.
+# This is the single largest latency term in the system.
+INSPECT_UNIFORM_MAX = _int("QA_INSPECT_UNIFORM_MAX", 70)
+INSPECT_RETRIEVE_TOP_K = _int("QA_INSPECT_RETRIEVE_TOP_K", 20)
+SUMMARY_FRAME_COUNT = _int("QA_SUMMARY_FRAME_COUNT", 30)
 ASSOCIATE_TOP_K_PER_CUE = 10
 
 # Transient-error retry for Gemini calls. Replaces Symphony's 5×(60s, doubling)
